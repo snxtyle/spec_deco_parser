@@ -1,4 +1,4 @@
-# juspay-eval-multilingual
+# Speculative-Decoding-Parser
 
 A multilingual evaluation dataset for payment transaction analysis. This project processes conversation data with tool_calls from local processed files and HuggingFace datasets into an OpenAI-compatible format.
 
