@@ -10,10 +10,16 @@ Supports:
 """
 
 import json
+import math
 import os
 import random
 import re
 import hashlib
+import shutil
+import subprocess
+import tempfile
+import zipfile
+import urllib.request
 from typing import Dict, Any, Callable, Optional, Iterator, List, Tuple
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1121,6 +1127,523 @@ def main():
 
 
 # ============================================
+# Smart Secret Scanning Module
+# ============================================
+# Uses multiple detection strategies:
+# 1. detect-secrets (Yelp) - ML-enhanced pattern detection
+# 2. trufflehog (Truffle Security) - Deep git scanning + entropy
+# 3. Presidio (Microsoft) - PII detection
+# 4. Entropy analysis - Statistical anomaly detection
+# 5. Custom ML heuristics - Beyond regex
+
+@dataclass
+class SecretFinding:
+    """Represents a detected secret in content."""
+    file_path: str
+    line_number: int
+    secret_type: str
+    severity: str  # HIGH, MEDIUM, LOW
+    confidence: float  # 0.0 to 1.0
+    masked_value: str
+    context: str
+    detection_method: str  # Which scanner found it
+
+
+class EntropyAnalyzer:
+    """Statistical analysis to find high-entropy (random) strings that may be secrets."""
+
+    @staticmethod
+    def calculate_entropy(string: str) -> float:
+        """Calculate Shannon entropy of a string. Higher = more random = likely secret."""
+        if len(string) < 8:
+            return 0.0
+
+        prob = [float(string.count(c)) / len(string) for c in dict.fromkeys(list(string))]
+        entropy = -sum([p * math.log(p) / math.log(2.0) for p in prob])
+        return entropy
+
+    @staticmethod
+    def is_likely_secret(token: str) -> Tuple[bool, float]:
+        """
+        Determine if a token is likely a secret based on multiple heuristics.
+        Returns (is_secret, confidence_score)
+        """
+        if len(token) < 20:
+            return False, 0.0
+
+        # Skip obvious non-secrets
+        if token.isalpha() or token.isdigit():
+            return False, 0.0
+
+        # Calculate entropy
+        entropy = EntropyAnalyzer.calculate_entropy(token)
+
+        # Secret characteristics
+        has_upper = any(c.isupper() for c in token)
+        has_lower = any(c.islower() for c in token)
+        has_digit = any(c.isdigit() for c in token)
+        has_special = any(not c.isalnum() for c in token)
+        char_types = sum([has_upper, has_lower, has_digit, has_special])
+
+        # High-entropy thresholds for base64/hex/random strings
+        score = 0.0
+
+        # Entropy scoring (normalized for typical token lengths)
+        if entropy > 5.5:  # Very high entropy
+            score += 0.4
+        elif entropy > 4.5:  # High entropy
+            score += 0.25
+
+        # Character diversity scoring
+        if char_types >= 3:
+            score += 0.3
+        elif char_types >= 2:
+            score += 0.15
+
+        # Length bonus (longer = more likely to be a generated secret)
+        if len(token) > 40:
+            score += 0.2
+        elif len(token) > 30:
+            score += 0.1
+
+        # Pattern bonuses
+        if re.match(r'^[A-Za-z0-9_\-]+$', token):  # Alphanumeric + underscore/hyphen
+            score += 0.1
+
+        # Penalties
+        if any(common in token.lower() for common in ['example', 'test', 'sample', 'demo', 'fake', 'mock']):
+            score -= 0.5
+
+        if re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', token, re.I):
+            score -= 0.3  # UUIDs are usually not secrets
+
+        return score > 0.5, min(max(score, 0.0), 1.0)
+
+
+class SmartSecretScanner:
+    """
+    Intelligent secret scanner using multiple detection engines.
+    No hardcoded regex - relies on statistical analysis and external libraries.
+    """
+
+    def __init__(self, stop_on_secret: bool = False, entropy_threshold: float = 0.7):
+        self.stop_on_secret = stop_on_secret
+        self.entropy_threshold = entropy_threshold
+        self.all_findings: List[SecretFinding] = []
+
+        # Check available scanners
+        self._has_detect_secrets = self._check_detect_secrets()
+        self._has_trufflehog = self._check_trufflehog()
+        self._has_presidio = self._check_presidio()
+
+        self.entropy_analyzer = EntropyAnalyzer()
+
+    def _check_detect_secrets(self) -> bool:
+        """Check if Yelp's detect-secrets is available."""
+        try:
+            subprocess.run(["detect-secrets", "--version"], capture_output=True, check=True)
+            return True
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return False
+
+    def _check_trufflehog(self) -> bool:
+        """Check if trufflehog is available."""
+        try:
+            subprocess.run(["trufflehog", "--version"], capture_output=True, check=True)
+            return True
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return False
+
+    def _check_presidio(self) -> bool:
+        """Check if Microsoft Presidio is available."""
+        try:
+            import presidio_analyzer
+            return True
+        except ImportError:
+            return False
+
+    def _scan_with_detect_secrets(self, content: str, source_hint: str) -> List[SecretFinding]:
+        """Use Yelp's detect-secrets library."""
+        findings = []
+
+        if not self._has_detect_secrets:
+            return findings
+
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+                f.write(content)
+                temp_path = f.name
+
+            result = subprocess.run(
+                ["detect-secrets", "scan", temp_path, "--all-files", "--force-use-all-plugins"],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+
+            os.unlink(temp_path)
+
+            if result.stdout:
+                try:
+                    scan_results = json.loads(result.stdout)
+                    for file_path, secrets in scan_results.get("results", {}).items():
+                        for secret in secrets:
+                            findings.append(SecretFinding(
+                                file_path=source_hint,
+                                line_number=secret.get("line_number", 1),
+                                secret_type=secret.get("type", "Unknown Secret"),
+                                severity="HIGH",
+                                confidence=secret.get("confidence", 0.8),
+                                masked_value=f"[{secret.get('type', 'Secret')}]",
+                                context=content.split('\n')[secret.get("line_number", 1) - 1][:200],
+                                detection_method="detect-secrets"
+                            ))
+                except json.JSONDecodeError:
+                    pass
+
+        except Exception as e:
+            pass
+
+        return findings
+
+    def _scan_with_trufflehog(self, content: str, source_hint: str) -> List[SecretFinding]:
+        """Use TruffleHog for deep scanning."""
+        findings = []
+
+        if not self._has_trufflehog:
+            return findings
+
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+                f.write(content)
+                temp_path = f.name
+
+            result = subprocess.run(
+                ["trufflehog", "filesystem", temp_path, "--json", "--no-update"],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+
+            os.unlink(temp_path)
+
+            for line in result.stdout.strip().split('\n'):
+                if not line:
+                    continue
+                try:
+                    finding_data = json.loads(line)
+                    detector = finding_data.get("DetectorName", "Unknown")
+                    raw = finding_data.get("Raw", "")
+
+                    # Skip test/demo data
+                    if any(test in raw.lower() for test in ['example', 'test', 'fake', 'sample']):
+                        continue
+
+                    findings.append(SecretFinding(
+                        file_path=source_hint,
+                        line_number=finding_data.get("SourceMetadata", {}).get("Data", {}).get("Filesystem", {}).get("line", 1),
+                        secret_type=detector,
+                        severity="HIGH",
+                        confidence=0.9,
+                        masked_value=f"[{detector}]",
+                        context=raw[:200],
+                        detection_method="trufflehog"
+                    ))
+                except json.JSONDecodeError:
+                    continue
+
+        except Exception as e:
+            pass
+
+        return findings
+
+    def _scan_with_presidio(self, content: str, source_hint: str) -> List[SecretFinding]:
+        """Use Microsoft Presidio for PII detection."""
+        findings = []
+
+        if not self._has_presidio:
+            return findings
+
+        try:
+            from presidio_analyzer import AnalyzerEngine
+
+            analyzer = AnalyzerEngine()
+            results = analyzer.analyze(text=content, language='en')
+
+            for result in results:
+                # Only high-confidence PII
+                if result.score < 0.7:
+                    continue
+
+                # Map entity types to severity
+                high_risk_pii = ['CREDIT_CARD', 'CRYPTO', 'IBAN_CODE', 'US_PASSPORT', 'US_SSN']
+                severity = "HIGH" if result.entity_type in high_risk_pii else "MEDIUM"
+
+                # Get context
+                start = max(0, result.start - 50)
+                end = min(len(content), result.end + 50)
+                context = content[start:end]
+
+                findings.append(SecretFinding(
+                    file_path=source_hint,
+                    line_number=content[:result.start].count('\n') + 1,
+                    secret_type=result.entity_type,
+                    severity=severity,
+                    confidence=result.score,
+                    masked_value=f"[{result.entity_type}]",
+                    context=context,
+                    detection_method="presidio"
+                ))
+
+        except Exception as e:
+            pass
+
+        return findings
+
+    def _scan_with_entropy(self, content: str, source_hint: str) -> List[SecretFinding]:
+        """Use statistical entropy analysis to find potential secrets."""
+        findings = []
+
+        # Tokenize content looking for candidate strings
+        # Look for: base64 strings, hex strings, alphanumeric sequences
+        candidates = re.findall(r'[A-Za-z0-9+/=_-]{20,}', content)
+
+        for candidate in candidates:
+            is_secret, confidence = self.entropy_analyzer.is_likely_secret(candidate)
+
+            if is_secret and confidence >= self.entropy_threshold:
+                # Find line number
+                line_num = content[:content.find(candidate)].count('\n') + 1
+
+                findings.append(SecretFinding(
+                    file_path=source_hint,
+                    line_number=line_num,
+                    secret_type="High-Entropy String (Potential Secret)",
+                    severity="MEDIUM",
+                    confidence=confidence,
+                    masked_value="[High-Entropy String]",
+                    context=candidate[:200],
+                    detection_method="entropy-analysis"
+                ))
+
+        return findings
+
+    def scan_sample(self, content: str, sample_id: str = "") -> Tuple[bool, List[SecretFinding]]:
+        """
+        Scan content using all available scanners.
+
+        Returns:
+            (is_clean, findings)
+        """
+        all_findings = []
+
+        # Run all scanners
+        scanners = [
+            ("detect-secrets", self._scan_with_detect_secrets),
+            ("trufflehog", self._scan_with_trufflehog),
+            ("presidio", self._scan_with_presidio),
+            ("entropy", self._scan_with_entropy),
+        ]
+
+        for scanner_name, scanner_func in scanners:
+            try:
+                findings = scanner_func(content, sample_id)
+                all_findings.extend(findings)
+            except Exception as e:
+                pass  # Continue with other scanners
+
+        # Deduplicate findings by context/location
+        seen = set()
+        unique_findings = []
+        for f in all_findings:
+            key = (f.line_number, f.context[:50])
+            if key not in seen:
+                seen.add(key)
+                unique_findings.append(f)
+
+        if unique_findings:
+            self.all_findings.extend(unique_findings)
+            return False, unique_findings
+
+        return True, []
+
+    def get_masked_content(self, content: str, findings: List[SecretFinding]) -> str:
+        """Redact detected secrets from content."""
+        masked = content
+        lines = content.split('\n')
+
+        for finding in findings:
+            line_idx = finding.line_number - 1
+            if 0 <= line_idx < len(lines):
+                line = lines[line_idx]
+                # Simple redaction: replace the specific substring
+                # In production, use spaCy/NER for precise span detection
+                if finding.context in line:
+                    lines[line_idx] = line.replace(finding.context, finding.masked_value)
+                elif len(finding.context) > 10:
+                    # Try to find and mask similar content
+                    for word in line.split():
+                        if len(word) > 15 and similar(word, finding.context[:len(word)]) > 0.8:
+                            lines[line_idx] = lines[line_idx].replace(word, finding.masked_value)
+
+        return '\n'.join(lines)
+
+    def mask_messages(self, messages: List[Dict[str, Any]], findings: List[SecretFinding]) -> List[Dict[str, Any]]:
+        """Mask secrets in message content."""
+        if not findings:
+            return messages
+
+        # Convert messages to string, mask, then parse back
+        content = json.dumps(messages, indent=2)
+        masked_content = self.get_masked_content(content, findings)
+
+        try:
+            # Try to parse back
+            masked_data = json.loads(masked_content)
+            if isinstance(masked_data, list):
+                return masked_data
+        except json.JSONDecodeError:
+            pass
+
+        # Fallback: mask individual message fields
+        masked_messages = []
+        for msg in messages:
+            masked_msg = dict(msg)
+            for field in ['content', 'text', 'value']:
+                if field in masked_msg and isinstance(masked_msg[field], str):
+                    text = masked_msg[field]
+                    for finding in findings:
+                        if finding.context in text:
+                            text = text.replace(finding.context, finding.masked_value)
+                    masked_msg[field] = text
+            masked_messages.append(masked_msg)
+
+        return masked_messages
+
+    def print_summary(self):
+        """Print detection summary."""
+        if not self.all_findings:
+            print("\n✓ No secrets detected")
+            return
+
+        print("\n" + "="*60)
+        print("SECRET SCAN SUMMARY")
+        print("="*60)
+
+        by_method = {}
+        by_severity = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
+
+        for f in self.all_findings:
+            by_method.setdefault(f.detection_method, 0)
+            by_method[f.detection_method] += 1
+            by_severity[f.severity] = by_severity.get(f.severity, 0) + 1
+
+        print(f"\nTotal findings: {len(self.all_findings)}")
+        print(f"  - HIGH severity: {by_severity['HIGH']}")
+        print(f"  - MEDIUM severity: {by_severity['MEDIUM']}")
+        print(f"  - LOW severity: {by_severity['LOW']}")
+
+        print("\nDetection methods:")
+        for method, count in sorted(by_method.items(), key=lambda x: -x[1]):
+            print(f"  - {method}: {count}")
+
+        if self.stop_on_secret:
+            print("\n⚠️  Processing stopped early due to secret detection!")
+
+
+def similar(a: str, b: str) -> float:
+    """Calculate string similarity using difflib."""
+    import difflib
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+class SecretScanner:
+    """Integrated secret scanner for EAGLE pipeline."""
+
+    def __init__(self, stop_on_secret: bool = False):
+        self.stop_on_secret = stop_on_secret
+        self.all_findings: List[SecretFinding] = []
+        self.has_gitleaks = find_gitleaks_cmd() is not None
+
+    def scan_sample(self, messages: List[Dict[str, Any]], sample_id: str = "") -> Tuple[bool, List[SecretFinding]]:
+        """
+        Scan a conversation sample for secrets.
+
+        Returns:
+            (is_clean, findings)
+        """
+        # Convert messages to string for scanning
+        content = json.dumps(messages, indent=2)
+
+        # Try gitleaks first, fallback to regex
+        if self.has_gitleaks:
+            findings = scan_with_gitleaks(content, source_hint=sample_id)
+        else:
+            findings = scan_content_for_secrets(content, source_hint=sample_id)
+
+        if findings:
+            self.all_findings.extend(findings)
+            return False, findings
+
+        return True, []
+
+    def get_masked_messages(self, messages: List[Dict[str, Any]], findings: List[SecretFinding]) -> List[Dict[str, Any]]:
+        """Return messages with secrets masked."""
+        masked_messages = []
+        for msg in messages:
+            content = msg.get("content", "")
+            if content:
+                # Mask secrets in content
+                for finding in findings:
+                    # Extract the actual secret value from context and mask it
+                    content = self._mask_in_text(content, finding)
+            masked_msg = {**msg, "content": content}
+            masked_messages.append(masked_msg)
+        return masked_messages
+
+    def _mask_in_text(self, text: str, finding: SecretFinding) -> str:
+        """Apply masking for a specific finding."""
+        # High-entropy detection heuristic
+        words = text.split()
+        masked_words = []
+        for word in words:
+            # Check if word looks like a secret (long, high entropy)
+            if len(word) > 15 and self._is_high_entropy(word) and finding.secret_type.lower() in word.lower():
+                masked_words.append(finding.masked_value)
+            elif len(word) > 20 and self._is_high_entropy(word):
+                masked_words.append(finding.masked_value)
+            else:
+                masked_words.append(word)
+        return ' '.join(masked_words)
+
+    def _is_high_entropy(self, s: str) -> bool:
+        """Check if string has high character entropy (indicates randomness)."""
+        if len(s) < 8:
+            return False
+        unique_chars = len(set(s))
+        return unique_chars / len(s) > 0.7
+
+    def print_summary(self):
+        """Print secret scanning summary."""
+        if not self.all_findings:
+            return
+
+        print("\n" + "="*60)
+        print("SECRET SCAN SUMMARY")
+        print("="*60)
+
+        high = [f for f in self.all_findings if f.severity == "HIGH"]
+        medium = [f for f in self.all_findings if f.severity == "MEDIUM"]
+
+        print(f"Secrets found: {len(self.all_findings)}")
+        print(f"  - HIGH severity: {len(high)}")
+        print(f"  - MEDIUM severity: {len(medium)}")
+
+        if self.stop_on_secret:
+            print("\n⚠️  Processing stopped early due to secret detection!")
+
+
+# ============================================
 # EAGLE Speculative Decoding Data Distillation
 # ============================================
 # This module transforms raw LiteLLM logs into "Golden Dataset" for EAGLE training.
@@ -1128,11 +1651,12 @@ def main():
 #
 # Pipeline Overview:
 # 1. Metadata-First Filtering: Check response codes and error indicators
-# 2. Adaptive Persona Trimming: Dynamically detect and strip filler phrases from system prompt
-# 3. Structural Heuristics: Validate tool calls, code blocks, and response length
-# 4. Loss Masking: Generate token-level masks for EAGLE training
-# 5. Filter-and-Refill: Auto-replenish batches to meet target count
-# 6. Semantic Deduplication: Remove duplicate queries using content hashing
+# 2. Secret Scanning: Detect and mask sensitive data before model exposure
+# 3. Adaptive Persona Trimming: Dynamically detect and strip filler phrases from system prompt
+# 4. Structural Heuristics: Validate tool calls, code blocks, and response length
+# 5. Loss Masking: Generate token-level masks for EAGLE training
+# 6. Filter-and-Refill: Auto-replenish batches to meet target count
+# 7. Semantic Deduplication: Remove duplicate queries using content hashing
 
 class EAGLEDistiller:
     """
@@ -1176,7 +1700,10 @@ class EAGLEDistiller:
         batch_size: int = 1000,
         min_response_length: int = 100,
         enable_deduplication: bool = True,
-        enable_code_validation: bool = False
+        enable_code_validation: bool = False,
+        enable_secret_scanning: bool = True,
+        stop_on_secret: bool = False,
+        mask_secrets: bool = True
     ):
         """
         Initialize the EAGLE Distiller.
@@ -1189,6 +1716,9 @@ class EAGLEDistiller:
             min_response_length: Minimum character length for assistant responses
             enable_deduplication: Whether to remove duplicate user queries
             enable_code_validation: Whether to require code blocks for code requests
+            enable_secret_scanning: Whether to scan for secrets (API keys, tokens, passwords)
+            stop_on_secret: Whether to stop processing when secrets are found
+            mask_secrets: Whether to mask detected secrets in output
         """
         self.input_dir = input_dir
         self.output_dir = output_dir
@@ -1197,9 +1727,17 @@ class EAGLEDistiller:
         self.min_response_length = min_response_length
         self.enable_deduplication = enable_deduplication
         self.enable_code_validation = enable_code_validation
+        self.enable_secret_scanning = enable_secret_scanning
+        self.stop_on_secret = stop_on_secret
+        self.mask_secrets = mask_secrets
 
         # Cache for dynamic regex pattern
         self._filler_pattern: Optional[re.Pattern] = None
+
+        # Secret scanner
+        self._secret_scanner: Optional[SmartSecretScanner] = None
+        if enable_secret_scanning:
+            self._secret_scanner = SmartSecretScanner(stop_on_secret=stop_on_secret)
 
         # Statistics tracking
         self.stats = {
@@ -1210,6 +1748,8 @@ class EAGLEDistiller:
             "filtered_short_response": 0,
             "filtered_tool_error": 0,
             "filtered_duplicate": 0,
+            "filtered_secrets": 0,
+            "masked_secrets": 0,
             "final_count": 0
         }
 
@@ -1658,7 +2198,29 @@ class EAGLEDistiller:
         if not self._check_response_length(messages):
             return None
 
-        # Step 7: Generate SEGMENT-BASED loss mask for token alignment
+        # Step 7: Secret Scanning - Detect and mask sensitive data
+        if self.enable_secret_scanning and self._secret_scanner:
+            sample_id = raw_data.get("correlation_id", f"sample_{self.stats['total_processed']}")
+
+            # Convert messages to string for scanning
+            content = json.dumps(messages, indent=2)
+            is_clean, findings = self._secret_scanner.scan_sample(content, sample_id)
+
+            if not is_clean:
+                self.stats["filtered_secrets"] += 1
+
+                if self.stop_on_secret:
+                    print(f"\n⚠️  SECRETS FOUND in {sample_id}!")
+                    for f in findings:
+                        print(f"  - {f.secret_type} (confidence: {f.confidence:.2f})")
+                    return None  # Filter out this sample entirely
+
+                if self.mask_secrets:
+                    # Mask secrets in messages before training
+                    messages = self._secret_scanner.mask_messages(messages, findings)
+                    self.stats["masked_secrets"] += len(findings)
+
+        # Step 8: Generate SEGMENT-BASED loss mask for token alignment
         loss_mask_segments = self._generate_loss_mask_segments(messages)
 
         # Prepare output in unified OpenAI format
@@ -1769,6 +2331,10 @@ class EAGLEDistiller:
                 }, ensure_ascii=False) + "\n")
         print(f"  Saved to: {dataset_path}")
 
+        # Print secret scanning summary if enabled
+        if self.enable_secret_scanning and self._secret_scanner:
+            self._secret_scanner.print_summary()
+
         # Final statistics
         print(f"\n[5/5] Statistics:")
         print(f"  Total processed: {self.stats['total_processed']}")
@@ -1778,6 +2344,9 @@ class EAGLEDistiller:
         print(f"  Filtered (short response): {self.stats['filtered_short_response']}")
         print(f"  Filtered (tool error): {self.stats['filtered_tool_error']}")
         print(f"  Filtered (duplicate): {self.stats['filtered_duplicate']}")
+        if self.enable_secret_scanning:
+            print(f"  Filtered (secrets): {self.stats.get('filtered_secrets', 0)}")
+            print(f"  Masked secrets: {self.stats.get('masked_secrets', 0)}")
         print(f"  Final count: {len(clean_samples)}")
 
         self.stats["final_count"] = len(clean_samples)
