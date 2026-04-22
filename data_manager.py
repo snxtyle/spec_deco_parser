@@ -1063,52 +1063,45 @@ def main():
     else:
         output_file = os.path.join(args.output, f"dataset_{timestamp}.jsonl")
 
-    print(f"\nWriting to: {output_file}")
+    # Route through EAGLEDistiller to generate loss_mask_segments and apply persona handling
+    print(f"\nProcessing through EAGLE distillation pipeline...")
 
-    # Write output
-    count = 0
-    json_data = []
+    # Convert samples to LiteLLM format for EAGLEDistiller
+    litellm_samples = []
+    for idx, sample in enumerate(final_samples):
+        litellm_format = {
+            "type": "SUCCESS",
+            "conversation": {"messages": sample.messages},
+            "response": {},
+            "_source": sources[idx % len(sources)] if len(sources) > 1 else sources[0]
+        }
+        litellm_samples.append(litellm_format)
 
+    # Run through EAGLEDistiller for proper mask generation and persona handling
+    distiller = EAGLEDistiller(
+        output_dir=args.output,
+        target_samples=len(litellm_samples),
+        enable_deduplication=args.deduplicate
+    )
+
+    # Process samples with source-aware handling
+    processed_samples = []
+    for raw_data in litellm_samples:
+        source = raw_data.pop("_source", "local")
+        processed = distiller._process_sample(raw_data, source=source)
+        if processed:
+            processed_samples.append(processed)
+
+    # Write unified output with loss_mask_segments
+    output_file = os.path.join(args.output, f"dataset_{timestamp}.jsonl")
     with open(output_file, "w") as f:
-        for sample in final_samples:
-            if args.format == "openai":
-                data = sample.to_openai_format()
-            elif args.format == "sharegpt":
-                # Convert to ShareGPT format
-                messages = sample.messages
-                conversations = []
-                for msg in messages:
-                    role = msg.get("role")
-                    from_val = "human" if role in ["user", "system", "tool"] else "gpt"
-                    value = msg.get("content", "")
-                    if msg.get("tool_calls"):
-                        # Add tool calls as special format
-                        for tc in msg["tool_calls"]:
-                            func = tc.get("function", {})
-                            conversations.append({
-                                "from": from_val,
-                                "value": f"[TOOL_CALL] {func.get('name')}({func.get('arguments')})"
-                            })
-                    else:
-                        conversations.append({
-                            "from": from_val,
-                            "value": value
-                        })
-                data = {"conversations": conversations}
-            else:  # training
-                data = sample.to_training_format()
+        for sample in processed_samples:
+            f.write(json.dumps({
+                "messages": sample["messages"],
+                "loss_mask_segments": sample["loss_mask_segments"]
+            }, ensure_ascii=False) + "\n")
 
-            if args.output_format == "json":
-                json_data.append(data)
-            else:
-                f.write(json.dumps(data, ensure_ascii=False) + "\n")
-
-            count += 1
-
-        if args.output_format == "json":
-            json.dump(json_data, f, ensure_ascii=False, indent=2)
-
-    print(f"Written {count} samples")
+    print(f"Written {len(processed_samples)} samples with loss_mask_segments")
 
     # Also print sample info
     if final_samples:
