@@ -1698,7 +1698,7 @@ class EAGLEDistiller:
         output_dir: str = "./golden",
         target_samples: int = 1000,
         batch_size: int = 1000,
-        min_response_length: int = 100,
+        min_response_length: int = 30,
         enable_deduplication: bool = True,
         enable_code_validation: bool = False,
         enable_secret_scanning: bool = True,
@@ -1805,7 +1805,7 @@ class EAGLEDistiller:
 
         return converted
 
-    def _check_metadata_filter(self, raw_data: Dict[str, Any]) -> bool:
+    def _check_metadata_filter(self, raw_data: Dict[str, Any], verbose: bool = False) -> bool:
         """
         Metadata-First Filtering: Check response status.
 
@@ -1819,6 +1819,8 @@ class EAGLEDistiller:
         response_type = raw_data.get("type", "")
         if response_type != "SUCCESS":
             self.stats["filtered_metadata"] += 1
+            if verbose:
+                print(f"    [FILTER] Metadata: type='{response_type}' (expected SUCCESS)")
             return False
 
         return True
@@ -2154,35 +2156,41 @@ class EAGLEDistiller:
         # Hash it
         return hashlib.sha256(normalized.encode()).hexdigest()
 
-    def _process_sample(self, raw_data: Dict[str, Any], source: str = "local") -> Optional[Dict[str, Any]]:
+    def _process_sample(self, raw_data: Dict[str, Any], source: str = "local", verbose: bool = False) -> Optional[Dict[str, Any]]:
         """
         Process a single raw sample through the full cleaning pipeline.
 
         Args:
             raw_data: Raw sample data
             source: "local" or "hf" - controls persona handling
+            verbose: Print filtering reasons
 
         Returns cleaned sample with segment-based loss masks, or None if filtered.
         """
         self.stats["total_processed"] += 1
+        sample_id = raw_data.get("correlation_id", f"sample_{self.stats['total_processed']}")
 
         # Step 1: Metadata-First Filtering
-        if not self._check_metadata_filter(raw_data):
+        if not self._check_metadata_filter(raw_data, verbose=verbose):
+            if verbose:
+                print(f"  [{sample_id}] FILTERED: metadata")
             return None
 
         # Step 2: Extract messages from LiteLLM format
         messages = self._extract_messages(raw_data)
 
         if not messages:
+            if verbose:
+                print(f"  [{sample_id}] FILTERED: no messages extracted")
             return None
 
         # Step 3: Source-Aware Persona Management
-        # Local: Keep original production prompts
-        # HF: Strip generic system prompts
         messages = self._inject_jar_persona(messages, source)
 
         # Step 4: Check for error content
         if not self._check_error_content(messages):
+            if verbose:
+                print(f"  [{sample_id}] FILTERED: error content detected")
             return None
 
         # Step 5: Adaptive Persona Trimming - remove filler phrases
@@ -2190,12 +2198,19 @@ class EAGLEDistiller:
 
         # Step 6: Structural Heuristics
         if not self._check_tool_integrity(messages):
+            if verbose:
+                print(f"  [{sample_id}] FILTERED: tool integrity check failed")
             return None
 
         if not self._check_code_blocks(messages):
+            if verbose:
+                print(f"  [{sample_id}] FILTERED: missing code blocks")
             return None
 
         if not self._check_response_length(messages):
+            if verbose:
+                content_len = sum(len(str(m.get("content",""))) for m in messages if m.get("role")=="assistant")
+                print(f"  [{sample_id}] FILTERED: response too short ({content_len}/{self.min_response_length} chars)")
             return None
 
         # Step 7: Secret Scanning - Detect and mask sensitive data
