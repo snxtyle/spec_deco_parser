@@ -1,254 +1,206 @@
-# Speculative-Decoding-Parser 🔐
+# P-EAGLE: Parallel Speculative Decoding Framework
 
-A multilingual evaluation dataset generator for payment transaction analysis. This project processes conversation data with tool_calls from local processed files, HuggingFace datasets, or GCS buckets into an OpenAI-compatible or ShareGPT format.
+Production-grade PyTorch framework for training and deploying Parallel Eagle (P-EAGLE) speculative decoding models.
 
-## Project Overview 📋
-
-This dataset is designed for training and evaluating AI models on payment transaction log analysis tasks. It contains conversations with:
-
-- 📝 System prompts defining the role of a payment transaction analysis agent
-- ❓ User queries about order investigations, payment failures, and transaction debugging
-- 🤖 Assistant responses with tool_calls to various analysis tools
-
-### Data Sources 📦
-
-1. **Local processed files** (`processed/`): JSON files from SSH machine data containing payment transaction logs
-2. **HuggingFace** (`Salesforce/xlam-function-calling-60k`): Function calling dataset for additional training data
-3. **GCS Bucket**: Google Cloud Storage bucket for cloud-based data sources
-
-## Project Structure 📂
+## Architecture
 
 ```
-juspay-eval-multilingual/
-├── output/            # Converted output files (JSONL/JSON)
-│   └── dataset_YYYYMMDD_HHMMSS.jsonl
-├── processed/        # Local JSON files with tool_calls (from SSH machine)
-├── raw/              # Raw chat completion data
-├── generate_data.py  # Main data generation script
-├── requirements.txt  # Python dependencies
-├── .env              # HuggingFace token and GCP credentials (sensitive)
-├── .env.example      # Template for .env
-└── example.json      # Example data format
+┌─────────────────────────────────────────────────────────────┐
+│                      TARGET MODEL                           │
+│                   (e.g., Gemma-7B)                          │
+│                      3072 hidden dim                         │
+└─────────────────────────────────────────────────────────────┘
+                              ▲
+                              │ features (h_t from layers 6, 12, 18)
+                              │
+┌─────────────────────────────────────────────────────────────┐
+│                      DRAFTER MODEL                          │
+│                  (e.g., Qwen-1.5B)                          │
+│                      1536 hidden dim                         │
+│                                                              │
+│  ┌─────────────┐    ┌──────────────────┐                    │
+│  │ Base LLM    │───→│ Dim Projection   │───→ 3072 dim       │
+│  │ (LoRA)      │    │ (1536 → 3072)    │                    │
+│  └─────────────┘    └──────────────────┘                    │
+│                              │                               │
+│           ┌──────────────────┼──────────────────┐            │
+│           ↓                  ↓                  ↓            │
+│     ┌──────────┐      ┌──────────┐      ┌──────────┐        │
+│     │ MTP h_1  │      │ MTP h_2  │      │ MTP h_K  │        │
+│     │  (t+1)   │      │  (t+2)   │      │  (t+K)   │        │
+│     └──────────┘      └──────────┘      └──────────┘        │
+│          │                  │                  │             │
+└──────────┼──────────────────┼──────────────────┼─────────────┘
+           │                  │                  │
+           ▼                  ▼                  ▼
+      Predict h_{t+1}   Predict h_{t+2}   Predict h_{t+K}
+      from h_t         from h_t          from h_t
 ```
 
-## Installation 🛠️
+## Pipeline
+
+### Stage 1: Feature Extraction
+```bash
+python extract_features.py \
+    --model_path google/gemma-7b-it \
+    --input_data ./output/dataset_*.jsonl \
+    --output_dir ./features \
+    --quantization 4bit \
+    --layers early,middle,final \
+    --fusion mean
+```
+
+**Output:** `.pt` files containing:
+- `input_ids`: Tokenized input
+- `fused_hidden_states`: Tri-layer fused features from target
+- `loss_mask`: Binary mask (1=assistant, 0=other)
+
+### Stage 2: Train Drafter
+```bash
+python train_drafter.py \
+    --drafter_model Qwen/Qwen2-1.5B-Instruct \
+    --target_hidden_dim 3072 \
+    --feature_dir ./features \
+    --output_dir ./checkpoints \
+    --speculation_depth 4 \
+    --use_lora \
+    --lora_rank 64 \
+    --batch_size 4 \
+    --num_epochs 3
+```
+
+**Key Features:**
+- **MTP Heads:** K parallel prediction heads for h_{t+1}...h_{t+K}
+- **Dim Projection:** Learnable adapter (drafter_dim → target_dim)
+- **Masked MSE Loss:** Only on assistant tokens
+- **Memory Efficient:** PagedAdamW8bit + LoRA + 4-bit base
+
+### Stage 3: Inference
+```bash
+python inference.py \
+    --target_model google/gemma-7b-it \
+    --drafter_checkpoint ./checkpoints/best_model \
+    --prompt "Explain quantum computing" \
+    --max_tokens 200
+```
+
+**Features:**
+- Parallel tree construction
+- Tree-attention verification
+- Mean Acceptance Length (MAL) tracking
+- Speedup measurement
+
+## Key Innovations
+
+### 1. Tri-Layer Feature Fusion
+Instead of using only the final layer, we fuse early, middle, and final layers:
+
+```python
+fused = mean([
+    hidden_states[layer_6],   # Early semantics
+    hidden_states[layer_12],  # Mid-level reasoning
+    hidden_states[layer_18]   # Final representations
+])
+```
+
+This captures multi-granular information for better distillation.
+
+### 2. Multi-Token Prediction (MTP)
+Standard EAGLE predicts one token ahead. P-EAGLE predicts K tokens in parallel:
+
+```python
+# Single forward pass, K predictions
+mtp_predictions = [
+    head_1(h_t) → h_{t+1},  # 1 token ahead
+    head_2(h_t) → h_{t+2},  # 2 tokens ahead
+    ...
+    head_K(h_t) → h_{t+K}   # K tokens ahead
+]
+```
+
+### 3. Tree Attention for Verification
+Verifies K speculative tokens with single target forward pass:
+
+```
+Position:  0    1    2    3    4    5    6
+Content:  [S]  [U]  [A]  [D1] [D2] [D3] [D4]
+           │    │    │    │    │    │    │
+Attention: └────┴────┘    │    │    │    │
+               ↑          │    │    │    │
+            verified    draft draft draft draft
+            context     tok1  tok2  tok3  tok4
+```
+
+Each draft token attends to all verified tokens + previous drafts.
+
+## Performance Expectations
+
+| Metric | Typical Value |
+|--------|--------------|
+| Mean Acceptance Length (MAL) | 2.5 - 3.5 tokens |
+| Speedup over autoregressive | 1.5x - 2.5x |
+| Training VRAM (1.5B drafter) | ~16-20 GB |
+| Inference VRAM (7B target + 1.5B drafter) | ~20-24 GB |
+
+## Directory Structure
+
+```
+p_eagle/
+├── extract_features.py      # Stage 1: Feature extraction
+├── train_drafter.py         # Stage 2: Drafter training
+├── inference.py             # Stage 3: Speculative decoding
+├── requirements.txt         # Dependencies
+└── README.md                # This file
+```
+
+## Installation
 
 ```bash
-# Install dependencies
 pip install -r requirements.txt
+
+# For 4-bit quantization
+pip install bitsandbytes
+
+# For secret scanning (optional)
+pip install detect-secrets presidio-analyzer
 ```
 
-Note: On macOS, you can also install via brew:
-```bash
-brew install gitleaks
+## Usage Example
+
+```python
+from p_eagle.inference import PEAGLEInference
+
+# Initialize
+engine = PEAGLEInference(
+    target_model_name="google/gemma-7b-it",
+    drafter_checkpoint="./checkpoints/best_model"
+)
+
+# Generate
+output, metrics = engine.generate(
+    prompt="Explain neural networks",
+    max_new_tokens=100
+)
+
+print(f"Generated: {output}")
+print(f"Speedup: {metrics.speedup:.2f}x")
+print(f"Mean Acceptance Length: {metrics.mean_acceptance_length:.2f}")
 ```
 
-## Configuration ⚙️
+## Citations
 
-1. Copy the example env file:
-```bash
-cp .env.example .env
-```
+```bibtex
+@article{eagle2024,
+  title={EAGLE: Speculative Sampling Requires Rethinking Feature Uncertainty},
+  author={Li, Xiaotian and Liu, Zheng and others},
+  journal={arXiv preprint},
+  year={2024}
+}
 
-2. Add your HuggingFace token to `.env`:
-```
-HF_TOKEN=your_huggingface_token_here
-```
-
-3. (Optional) Add GCP credentials for GCS bucket scanning:
-```
-GCP_PROJECT_ID=your_project_id
-# OR
-GCP_SERVICE_ACCOUNT_KEY=/path/to/service-account-key.json
-# OR
-GCP_CREDENTIALS_B64=your_base64_encoded_credentials
-```
-
-🔑 Get a HuggingFace token from: https://huggingface.co/settings/tokens
-
-## Usage 🚀
-
-### Basic Usage
-
-```bash
-# Generate dataset from local files only (10 samples, OpenAI format)
-python3 generate_data.py -n 10 -o ./output -f openai --local
-
-# Generate dataset from local files (ShareGPT format)
-python3 generate_data.py -n 10 -o ./output -f sharegpt --local
-
-# Generate dataset from HuggingFace only
-python3 generate_data.py -n 10 -o ./output -f openai --hf
-
-# Generate dataset from GCS bucket
-python3 generate_data.py -n 10 -o ./output -f openai --gcs my-bucket
-```
-
-### Multiple Sources with Ratio
-
-```bash
-# Mix HuggingFace and local sources with ratio
-python3 generate_data.py -n 100 -o ./output -f openai --hf --local --ratio hf:0.6,local:0.4
-```
-
-### Additional Options
-
-```bash
-# With minimum word filter for assistant responses
-python3 generate_data.py -n 10 -o ./output -f openai --local --min-words 30
-
-# Stop processing if secrets are detected
-python3 generate_data.py -n 10 -o ./output -f openai --local --stop-on-secret
-
-# Remove duplicate samples
-python3 generate_data.py -n 10 -o ./output -f openai --local --deduplicate
-
-# Output as JSON instead of JSONL
-python3 generate_data.py -n 10 -o ./output -f openai --local --output-format json
-
-# Resume from existing output file
-python3 generate_data.py -n 10 -o ./output -f openai --local --resume ./output/existing.jsonl
-
-# Custom input directory
-python3 generate_data.py -n 10 -o ./output --local --input-dir ./my-data
-
-# Custom HuggingFace dataset
-python3 generate_data.py -n 10 -o ./output --hf --hf-dataset another/dataset
-```
-
-#### CLI Arguments
-
-| Argument | Description | Default |
-|----------|-------------|---------|
-| `-o`, `--output` | Output directory | `./output` |
-| `-f`, `--format` | Output format: `openai` or `sharegpt` | `openai` |
-| `-n`, `--num-samples` | Total number of samples to generate | `1000` |
-| `--hf` | Use HuggingFace dataset as source | - |
-| `--local` | Use local files as source | - |
-| `--gcs` | Use GCS bucket as source | - |
-| `--ratio` | Ratio for mixing sources (e.g., `hf:0.6,local:0.4`) | - |
-| `--input-dir` | Input directory for local JSON files | `./processed` |
-| `--hf-dataset` | HuggingFace dataset name | `Salesforce/xlam-function-calling-60k` |
-| `--min-words` | Minimum words in assistant response (0=disabled) | `0` |
-| `--stop-on-secret` | Stop if secrets detected | `false` |
-| `--deduplicate` | Remove duplicate samples based on content hash | `false` |
-| `--resume` | Resume from existing JSONL/JSON file | - |
-| `--output-format` | Output format: `jsonl` or `json` | `jsonl` |
-
-## Output Format 📄
-
-### OpenAI Format (default)
-
-```json
-{
-  "messages": [
-    {"role": "system", "content": "You are a helpful assistant."},
-    {"role": "user", "content": "What is the status of order 12345?"},
-    {"role": "assistant", "content": null, "tool_calls": [
-      {
-        "id": "call_123",
-        "type": "function",
-        "function": {
-          "name": "get_order_status",
-          "arguments": "{\"order_id\": \"12345\"}"
-        }
-      }
-    ]},
-    {"role": "tool", "content": "Order status: CONFIRMED", "tool_call_id": "call_123"},
-    {"role": "assistant", "content": "The order 12345 is CONFIRMED."}
-  ]
+@article{levithan2023fast,
+  title={Fast Inference from Transformers via Speculative Decoding},
+  author={Leviathan, Yaniv and Kalman, Matan and Matias, Yossi},
+  journal={ICML},
+  year={2023}
 }
 ```
-
-### ShareGPT Format
-
-```json
-{
-  "conversations": [
-    {"from": "human", "value": "You are a helpful assistant."},
-    {"from": "human", "value": "What is the status of order 12345?"},
-    {"from": "gpt", "value": "\n[Tool Calls]:\n- get_order_status({\"order_id\": \"12345\"})\n\nOrder status: CONFIRMED"}
-  ]
-}
-```
-
-> ⚠️ Note: ShareGPT format converts tool_calls to text representation since ShareGPT doesn't natively support them.
-
-## System Resource Monitoring 💻
-
-The script displays system resources before generating the dataset:
-
-```
-============================================================
-SYSTEM RESOURCES
-============================================================
-
-CPU:
-  Cores: 14 logical, 14 physical
-  Usage: 18.2%
-
-Memory:
-  Total: 24.0 GB
-  Available: 5.25 GB
-  Usage: 78.1%
-
-Storage (current disk):
-  Total: 460.43 GB
-  Free: 130.0 GB
-  Usage: 71.8%
-
-Estimated output size: ~2 KB per sample
-```
-
-## Sensitive Data Scanning 🔒
-
-The script includes a **sensitive data scanner** to detect API keys, tokens, passwords, and other secrets using gitleaks, trufflehog, or detect-secrets.
-
-### Scan local directory
-
-```bash
-python3 generate_data.py scan-secrets --path .
-```
-
-### Scan specific directory
-
-```bash
-python3 generate_data.py scan-secrets --path ./processed
-```
-
-### Scan GCS bucket
-
-```bash
-python3 generate_data.py scan-secrets --path my-bucket-name
-```
-
-### Save findings to JSON
-
-```bash
-python3 generate_data.py scan-secrets --path . --output findings.json
-```
-
-#### Scan-secrets CLI Arguments
-
-| Argument | Description | Default |
-|----------|-------------|---------|
-| `--path` | Path to scan (directory or GCS bucket name) | `.` |
-| `--extensions` | File extensions to scan | `.json, .yaml, .yml, .env, .txt, .py, .js, .ts, .sh, .tf, .cfg, .ini, .properties` |
-| `--output` | Save findings to JSON file | - |
-
-### Detected Secret Types
-
-- 🔴 **HIGH**: AWS keys, GCP keys, OpenAI API keys, HuggingFace tokens, GitHub/GitLab tokens, Stripe keys, passwords, database URLs with credentials, private keys, PayPal/Razorpay keys
-- 🟡 **MEDIUM**: Generic API keys, Stripe test keys, environment variable references
-
-> ✅ Secret scanning is **always enabled** during data generation. Use `--stop-on-secret` to halt processing when secrets are detected.
-
-## Dataset Statistics 📊
-
-- 📁 Local processed files: ~96 samples with tool_calls
-- 🤗 HuggingFace (xlam-function-calling-60k): 60,000 samples
-- ➕ Combined output: Validated samples with system+user+assistant+tool_calls
-
-## License 📜
-
-See LICENSE file for details.

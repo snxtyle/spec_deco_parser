@@ -1,13 +1,38 @@
-# Core dependencies
-datasets>=2.0.0
-python-dotenv>=1.0.0
+# P-EAGLE Dependencies
+# Core
+numpy>=1.24.0
+scipy>=1.10.0
+tqdm>=4.65.0
 
-# System monitoring
-psutil>=5.9.0
+# PyTorch
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
 
-# Secret detection
+# Transformers & NLP
+transformers>=4.35.0
+tokenizers>=0.14.0
+accelerate>=0.24.0
+
+# Quantization & Efficiency
+bitsandbytes>=0.41.0
+optimum>=1.13.0
+
+# PEFT (LoRA)
+peft>=0.6.0
+
+# Training Utilities
+tensorboard>=2.14.0
+wandb>=0.15.0
+
+# Secret Scanning (Optional)
 detect-secrets>=1.4.0
-trufflehog>=2.2.0
+presidio-analyzer>=2.2.0
 
-# GCS bucket access
-google-cloud-storage>=2.0.0
+# Data Processing
+datasets>=2.14.0
+dill>=0.3.7
+
+# JSON & Config
+pyyaml>=6.0.0
+jsonlines>=3.1.0

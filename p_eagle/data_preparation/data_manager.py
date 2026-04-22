@@ -2097,28 +2097,52 @@ class EAGLEDistiller:
             "segments": segments
         }
 
+    # Master system prompt for EAGLE training when no system message exists
+    MASTER_SYSTEM_PROMPT = """You are a helpful AI assistant. Answer user questions accurately and concisely."""
+
     def _inject_jar_persona(self, messages: List[Dict[str, Any]], source: str) -> List[Dict[str, Any]]:
         """
-        Source-Aware Persona Management:
-        - Local: Keep original high-fidelity prompts (JAR, Config Agent, etc.)
-        - HF: Remove generic system prompts - let HF data speak naturally
+        Source-Aware Persona Management with System Message Enforcement.
+
+        CRITICAL: EAGLE training requires system message to be FIRST in conversation.
+        This ensures consistent hidden state patterns for the draft model.
+
+        Rules:
+        - If first message is system: keep it (local) or replace with master (HF)
+        - If no system message: prepend MASTER_SYSTEM_PROMPT
+        - Never allow conversation to start with user/assistant
 
         Args:
             messages: Conversation messages
             source: "local" or "hf" - determines persona handling
 
         Returns:
-            Messages with appropriate persona handling
+            Messages guaranteed to start with system message
         """
-        if source == "local":
-            # Keep original production prompts exactly as-is
-            # Local logs have JAR, Config Agent, Taxonomy Expert, etc.
-            return messages
+        if not messages:
+            return [{"role": "system", "content": self.MASTER_SYSTEM_PROMPT}]
 
-        # For HF data: strip generic system prompts
-        # HF samples often have "You are a helpful assistant" which we remove
-        # to avoid polluting the hidden state space
-        return [msg for msg in messages if msg.get("role") != "system"]
+        # Check if first message is system
+        if messages[0].get("role") == "system":
+            if source == "local":
+                # Keep original production prompts (JAR, Config Agent, etc.)
+                return messages
+            else:
+                # HF data: replace generic system prompts with master
+                system_content = messages[0].get("content", "")
+                # Check if it's a generic HF prompt
+                if any(generic in system_content.lower() for generic in [
+                    "helpful assistant", "you are an ai", "you are a helpful",
+                    "opencode", "assistant designed to"
+                ]):
+                    # Replace with master prompt
+                    return [{"role": "system", "content": self.MASTER_SYSTEM_PROMPT}] + messages[1:]
+                else:
+                    # Keep non-generic system prompts
+                    return messages
+
+        # No system message at start - prepend master prompt
+        return [{"role": "system", "content": self.MASTER_SYSTEM_PROMPT}] + messages
 
     def _generate_loss_mask(self, messages: List[Dict[str, Any]]) -> List[int]:
         """

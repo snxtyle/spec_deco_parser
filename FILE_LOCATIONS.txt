@@ -1,0 +1,63 @@
+===============================================================================
+FILE LOCATIONS - Updated Organization
+===============================================================================
+
+MAIN SCRIPTS (Entry Points):
+----------------------------
+scripts/generate_data.py          -> Data generation CLI
+
+PACKAGE MODULES (p_eagle/):
+--------------------------
+p_eagle/data_preparation/data_manager.py    -> EAGLEDistiller class
+p_eagle/data_preparation/secret_scanner.py  -> SmartSecretScanner
+
+p_eagle/models/eagle_drafter.py    -> EagleDrafterModel, EagleMTPHead
+p_eagle/models/tree_attention.py   -> TreeAttentionMask
+
+p_eagle/training/feature_extractor.py  -> Feature extraction
+p_eagle/training/trainer.py            -> Training loop
+
+p_eagle/inference/inference_engine.py  -> Inference engine
+
+p_eagle/utils/feature_utils.py     -> Dataset classes
+p_eagle/utils/loss_utils.py        -> Loss functions
+p_eagle/utils/metrics.py           -> Metrics tracking
+
+CLI SCRIPTS (p_eagle/scripts/):
+------------------------------
+p_eagle/scripts/extract_features.py    -> python -m p_eagle.scripts.extract_features
+p_eagle/scripts/train_drafter.py       -> python -m p_eagle.scripts.train_drafter
+p_eagle/scripts/run_inference.py       -> python -m p_eagle.scripts.run_inference
+
+DATA DIRECTORIES:
+----------------
+data/raw/           -> Original LiteLLM logs (*.json)
+data/processed/     -> Processed intermediate files
+data/features/      -> Extracted PyTorch tensors (*.pt)
+data/output/        -> Generated datasets (*.jsonl)
+
+checkpoints/        -> Model checkpoints
+logs/               -> Training logs
+tests/              -> Unit tests
+configs/            -> YAML config files
+docs/               -> Documentation
+
+USAGE:
+-----
+# 1. Generate dataset
+python scripts/generate_data.py --local -n 1000
+
+# 2. Extract features
+python -m p_eagle.scripts.extract_features \
+    --model_path google/gemma-7b \
+    --input_data data/output/dataset_*.jsonl
+
+# 3. Train drafter
+python -m p_eagle.scripts.train_drafter \
+    --drafter_model Qwen-1.5B \
+    --feature_dir data/features
+
+# 4. Run inference
+python -m p_eagle.scripts.run_inference \
+    --target_model gemma-7b \
+    --drafter_checkpoint checkpoints/best_model

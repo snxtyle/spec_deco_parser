@@ -1,8 +1,25 @@
+# Environment
 .env
-/example.json
-processed/*
-raw/*
+
+# Data directories
+data/raw/
+data/processed/
+data/features/
+data/output/
+
+# Output directory
 output/*
-__pycache__
+
+# Example files
+/example.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Claude
 .claude
 
