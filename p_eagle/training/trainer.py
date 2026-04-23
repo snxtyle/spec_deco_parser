@@ -9,8 +9,11 @@ using Multi-Token Prediction (MTP) heads with parallel speculation.
 import argparse
 import json
 import os
+import shutil
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
+from datetime import timedelta
 
 import torch
 import torch.nn as nn
@@ -25,6 +28,175 @@ from ..models.eagle_drafter import EagleDrafterModel
 from ..utils.feature_utils import EagleTrainingDataset
 from ..utils.loss_utils import masked_mse_loss
 from ..utils.metrics import MetricsTracker, GenerationMetrics
+
+
+def print_section(title: str):
+    """Print formatted section header."""
+    print(f"\n{'='*70}")
+    print(f"  {title}")
+    print(f"{'='*70}")
+
+
+def get_gpu_info() -> Dict[str, Any]:
+    """Get detailed GPU information."""
+    info = {
+        "cuda_available": torch.cuda.is_available(),
+        "device_count": 0,
+        "devices": []
+    }
+
+    if not torch.cuda.is_available():
+        return info
+
+    info["device_count"] = torch.cuda.device_count()
+
+    for i in range(info["device_count"]):
+        props = torch.cuda.get_device_properties(i)
+        total_memory = props.total_memory / (1024**3)  # GB
+
+        # Get current memory usage
+        allocated = torch.cuda.memory_allocated(i) / (1024**3)
+        reserved = torch.cuda.memory_reserved(i) / (1024**3)
+        free = total_memory - allocated
+
+        info["devices"].append({
+            "index": i,
+            "name": props.name,
+            "total_memory_gb": round(total_memory, 2),
+            "allocated_gb": round(allocated, 2),
+            "reserved_gb": round(reserved, 2),
+            "free_gb": round(free, 2),
+            "multi_processor_count": props.multi_processor_count,
+            "compute_capability": f"{props.major}.{props.minor}"
+        })
+
+    return info
+
+
+def estimate_vram_requirements(
+    drafter_params_b: float,
+    target_hidden_dim: int,
+    batch_size: int,
+    seq_length: int = 2048,
+    speculation_depth: int = 4,
+    use_lora: bool = True
+) -> Dict[str, float]:
+    """
+    Estimate VRAM requirements in GB.
+
+    Args:
+        drafter_params_b: Drafter model size in billions (e.g., 1.5 for 1.5B)
+        target_hidden_dim: Target model hidden dimension
+        batch_size: Training batch size
+        seq_length: Maximum sequence length
+        speculation_depth: Number of MTP heads
+        use_lora: Whether using LoRA
+    """
+    # Base model memory (parameters in fp16/bf16)
+    param_bytes = 2 if use_lora else 4  # LoRA keeps base frozen in 16-bit
+    base_model_gb = drafter_params_b * param_bytes
+
+    # LoRA parameters (if enabled) - typically ~0.5-2% of base
+    lora_gb = base_model_gb * 0.01 if use_lora else 0
+
+    # Gradients (only for trainable params)
+    gradients_gb = lora_gb if use_lora else base_model_gb
+
+    # Optimizer states (PagedAdamW8bit uses 8-bit, but let's be conservative)
+    optimizer_gb = lora_gb * 2 if use_lora else base_model_gb * 2
+
+    # Activations (forward pass)
+    # Rough estimate: batch * seq * hidden * layers * 4 bytes
+    # Assuming ~24 layers average, 2x buffer for intermediate activations
+    est_layers = 24 if drafter_params_b >= 1.5 else 16
+    activation_gb = (batch_size * seq_length * 1536 * est_layers * 4) / (1024**3)
+
+    # MTP heads memory (parallel predictions)
+    mtp_head_gb = (speculation_depth * batch_size * seq_length * target_hidden_dim * 4) / (1024**3)
+
+    # Feature cache during training
+    feature_cache_gb = (batch_size * seq_length * target_hidden_dim * 4) / (1024**3)
+
+    # System overhead (CUDA context, fragmentation, etc.)
+    overhead_gb = 2.0
+
+    total_gb = (
+        base_model_gb +
+        lora_gb +
+        gradients_gb +
+        optimizer_gb +
+        activation_gb +
+        mtp_head_gb +
+        feature_cache_gb +
+        overhead_gb
+    )
+
+    return {
+        "base_model_gb": round(base_model_gb, 2),
+        "lora_params_gb": round(lora_gb, 2),
+        "gradients_gb": round(gradients_gb, 2),
+        "optimizer_states_gb": round(optimizer_gb, 2),
+        "activations_gb": round(activation_gb, 2),
+        "mtp_heads_gb": round(mtp_head_gb, 2),
+        "feature_cache_gb": round(feature_cache_gb, 2),
+        "overhead_gb": overhead_gb,
+        "total_required_gb": round(total_gb, 2),
+        "recommended_gb": round(total_gb * 1.2, 2)  # 20% safety margin
+    }
+
+
+def estimate_training_time(
+    num_samples: int,
+    num_epochs: int,
+    batch_size: int,
+    steps_per_sec: float = 1.5
+) -> Dict[str, Any]:
+    """Estimate total training time."""
+    steps_per_epoch = (num_samples + batch_size - 1) // batch_size
+    total_steps = steps_per_epoch * num_epochs
+    total_seconds = total_steps / steps_per_sec
+
+    return {
+        "steps_per_epoch": steps_per_epoch,
+        "total_steps": total_steps,
+        "estimated_total_seconds": total_seconds,
+        "estimated_total_time": str(timedelta(seconds=int(total_seconds))),
+        "time_per_epoch": str(timedelta(seconds=int(steps_per_epoch / steps_per_sec)))
+    }
+
+
+def check_disk_space(path: str, required_gb: float = 10.0) -> Dict[str, Any]:
+    """Check available disk space."""
+    usage = shutil.disk_usage(path)
+    free_gb = usage.free / (1024**3)
+    total_gb = usage.total / (1024**3)
+
+    return {
+        "path": path,
+        "total_gb": round(total_gb, 2),
+        "free_gb": round(free_gb, 2),
+        "required_gb": required_gb,
+        "sufficient": free_gb >= required_gb
+    }
+
+
+def parse_model_size(model_name: str) -> float:
+    """Extract model size in billions from name."""
+    import re
+    # Look for patterns like 1.5B, 7B, 0.5B, etc.
+    match = re.search(r'(\d+\.?\d*)[Bb]', model_name)
+    if match:
+        return float(match.group(1))
+    # Check for common sizes in name
+    if "0.5" in model_name.lower():
+        return 0.5
+    elif "1.5" in model_name.lower():
+        return 1.5
+    elif "3" in model_name.lower():
+        return 3.0
+    elif "7" in model_name.lower():
+        return 7.0
+    return 1.5  # Default assumption
 
 
 class EagleTrainer:
@@ -45,15 +217,29 @@ class EagleTrainer:
         warmup_steps: int = 100,
         max_grad_norm: float = 1.0,
         save_every: int = 1000,
-        device: str = "cuda"
+        device: str = "cuda",
+        skip_hardware_check: bool = False
     ):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.feature_dir = feature_dir
         self.num_epochs = num_epochs
         self.max_grad_norm = max_grad_norm
         self.save_every = save_every
         self.device = device
         self.global_step = 0
+        self.drafter_model_name = drafter_model_name
+
+        # Hardware requirement check
+        if not skip_hardware_check:
+            self._run_hardware_check(
+                drafter_model_name=drafter_model_name,
+                target_hidden_dim=target_hidden_dim,
+                batch_size=batch_size,
+                speculation_depth=speculation_depth,
+                use_lora=use_lora,
+                num_epochs=num_epochs
+            )
 
         # Initialize model
         self.model = EagleDrafterModel(
@@ -124,6 +310,156 @@ class EagleTrainer:
         print(f"  Epochs: {num_epochs}")
         print(f"  Batch size: {batch_size}")
         print(f"  Total steps: {total_steps}")
+
+    def _run_hardware_check(
+        self,
+        drafter_model_name: str,
+        target_hidden_dim: int,
+        batch_size: int,
+        speculation_depth: int,
+        use_lora: bool,
+        num_epochs: int
+    ):
+        """Run comprehensive hardware requirement check before training."""
+        print_section("P-EAGLE TRAINING - HARDWARE CHECK")
+
+        # Parse model size
+        model_size_b = parse_model_size(drafter_model_name)
+        print(f"\n📊 Model: {drafter_model_name}")
+        print(f"   Estimated size: ~{model_size_b}B parameters")
+        print(f"   Target hidden dim: {target_hidden_dim}")
+        print(f"   Speculation depth (K): {speculation_depth}")
+        print(f"   LoRA enabled: {use_lora}")
+
+        # GPU Check
+        print_section("GPU AVAILABILITY")
+        gpu_info = get_gpu_info()
+
+        if not gpu_info["cuda_available"]:
+            print("❌ ERROR: CUDA not available!")
+            print("   Training requires at least one NVIDIA GPU.")
+            raise RuntimeError("CUDA not available. GPU is required for training.")
+
+        print(f"✅ CUDA available")
+        print(f"   Device count: {gpu_info['device_count']}")
+
+        total_gpu_memory = 0
+        for dev in gpu_info["devices"]:
+            print(f"\n   GPU {dev['index']}: {dev['name']}")
+            print(f"   ├── Total memory: {dev['total_memory_gb']:.2f} GB")
+            print(f"   ├── Free memory: {dev['free_gb']:.2f} GB")
+            print(f"   ├── Compute capability: {dev['compute_capability']}")
+            print(f"   └── Multi-processors: {dev['multi_processor_count']}")
+            total_gpu_memory += dev['total_memory_gb']
+
+        # VRAM Estimation
+        print_section("VRAM REQUIREMENTS")
+        vram_req = estimate_vram_requirements(
+            drafter_params_b=model_size_b,
+            target_hidden_dim=target_hidden_dim,
+            batch_size=batch_size,
+            speculation_depth=speculation_depth,
+            use_lora=use_lora
+        )
+
+        print(f"\nEstimated VRAM breakdown:")
+        print(f"  Base model ({'16-bit' if use_lora else '32-bit'}): {vram_req['base_model_gb']:.2f} GB")
+        if use_lora:
+            print(f"  LoRA parameters: {vram_req['lora_params_gb']:.2f} GB")
+            print(f"  Gradients (LoRA only): {vram_req['gradients_gb']:.2f} GB")
+        else:
+            print(f"  Gradients (full): {vram_req['gradients_gb']:.2f} GB")
+        print(f"  Optimizer states: {vram_req['optimizer_states_gb']:.2f} GB")
+        print(f"  Activations: {vram_req['activations_gb']:.2f} GB")
+        print(f"  MTP heads: {vram_req['mtp_heads_gb']:.2f} GB")
+        print(f"  Feature cache: {vram_req['feature_cache_gb']:.2f} GB")
+        print(f"  System overhead: {vram_req['overhead_gb']:.2f} GB")
+        print(f"\n{'─'*50}")
+        print(f"  TOTAL REQUIRED: ~{vram_req['total_required_gb']:.2f} GB")
+        print(f"  RECOMMENDED: ~{vram_req['recommended_gb']:.2f} GB (20% margin)")
+
+        # Check if sufficient VRAM
+        if vram_req['recommended_gb'] > total_gpu_memory:
+            print(f"\n⚠️  WARNING: Insufficient GPU memory!")
+            print(f"   You have: {total_gpu_memory:.2f} GB total")
+            print(f"   Recommended: {vram_req['recommended_gb']:.2f} GB")
+            print(f"\n   Suggestions:")
+            print(f"   • Reduce batch_size (currently {batch_size})")
+            print(f"   • Use a smaller drafter model")
+            print(f"   • Reduce speculation_depth (currently {speculation_depth})")
+            print(f"   • Use gradient accumulation instead")
+
+            user_input = input("\nContinue anyway? [y/N]: ").strip().lower()
+            if user_input != 'y':
+                raise RuntimeError("Hardware requirements not met. Aborting.")
+        else:
+            print(f"\n✅ Sufficient GPU memory available")
+
+        # Disk Space Check
+        print_section("DISK SPACE CHECK")
+        # Estimate: base model (~3GB) + checkpoints (~10GB) + logs (~1GB)
+        estimated_need_gb = 15 + (model_size_b * 2)
+        disk_check = check_disk_space(str(self.output_dir), estimated_need_gb)
+
+        print(f"Output directory: {disk_check['path']}")
+        print(f"  Total: {disk_check['total_gb']:.2f} GB")
+        print(f"  Free: {disk_check['free_gb']:.2f} GB")
+        print(f"  Estimated need: ~{estimated_need_gb:.2f} GB")
+
+        if not disk_check['sufficient']:
+            print(f"\n⚠️  WARNING: Low disk space!")
+            user_input = input("Continue anyway? [y/N]: ").strip().lower()
+            if user_input != 'y':
+                raise RuntimeError("Insufficient disk space. Aborting.")
+        else:
+            print(f"✅ Sufficient disk space")
+
+        # Training Time Estimation
+        print_section("TRAINING TIME ESTIMATE")
+
+        # Count feature files
+        feature_files = list(Path(self.feature_dir if hasattr(self, 'feature_dir') else ".").glob("*.pt"))
+        num_samples = len(feature_files)
+
+        if num_samples > 0:
+            time_est = estimate_training_time(
+                num_samples=num_samples,
+                num_epochs=num_epochs,
+                batch_size=batch_size
+            )
+
+            print(f"Dataset: {num_samples} samples")
+            print(f"Epochs: {num_epochs}")
+            print(f"Steps per epoch: {time_est['steps_per_epoch']}")
+            print(f"Total steps: {time_est['total_steps']}")
+            print(f"\n⏱️  Estimated training time:")
+            print(f"   Per epoch: {time_est['time_per_epoch']}")
+            print(f"   Total: ~{time_est['estimated_total_time']}")
+        else:
+            print(f"⚠️  No feature files found yet. Cannot estimate training time.")
+
+        # Model Download Info
+        print_section("MODEL DOWNLOAD INFO")
+        print(f"Drafter model will be downloaded from HuggingFace:")
+        print(f"  {drafter_model_name}")
+        print(f"\nCache location: ~/.cache/huggingface/hub/")
+        print(f"Download size: ~{model_size_b * 2:.1f} GB (weights + tokenizer)")
+
+        # Final confirmation
+        print_section("READY TO START")
+        print("\nConfiguration summary:")
+        print(f"  Drafter: {drafter_model_name}")
+        print(f"  Target hidden dim: {target_hidden_dim}")
+        print(f"  Batch size: {batch_size}")
+        print(f"  Epochs: {num_epochs}")
+        print(f"  LoRA rank: {64 if use_lora else 'N/A (full fine-tune)'}")
+        print(f"  Output dir: {self.output_dir}")
+
+        user_input = input("\nStart training? [Y/n]: ").strip().lower()
+        if user_input == 'n':
+            raise RuntimeError("Training cancelled by user.")
+
+        print("\n🚀 Starting training...\n")
 
     def _collate_fn(self, batch: List[Dict]) -> Dict[str, torch.Tensor]:
         """Collate function for batching."""
@@ -263,6 +599,8 @@ def main():
     parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--warmup_steps", type=int, default=100)
+    parser.add_argument("--skip-hardware-check", action="store_true",
+                        help="Skip GPU/disk requirements check")
 
     args = parser.parse_args()
 
@@ -277,7 +615,8 @@ def main():
         learning_rate=args.learning_rate,
         batch_size=args.batch_size,
         num_epochs=args.num_epochs,
-        warmup_steps=args.warmup_steps
+        warmup_steps=args.warmup_steps,
+        skip_hardware_check=args.skip_hardware_check
     )
 
     trainer.train()
