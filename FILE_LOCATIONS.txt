@@ -36,11 +36,8 @@ data/processed/     -> Processed intermediate files
 data/features/      -> Extracted PyTorch tensors (*.pt)
 data/output/        -> Generated datasets (*.jsonl)
 
-checkpoints/        -> Model checkpoints
-logs/               -> Training logs
-tests/              -> Unit tests
-configs/            -> YAML config files
-docs/               -> Documentation
+checkpoints/        -> Model checkpoints (created during training)
+logs/               -> Training logs (created during training)
 
 USAGE:
 -----

@@ -41,10 +41,10 @@ Production-grade PyTorch framework for training and deploying Parallel Eagle (P-
 
 ### Stage 1: Feature Extraction
 ```bash
-python extract_features.py \
+python -m p_eagle.scripts.extract_features \
     --model_path google/gemma-7b-it \
-    --input_data ./output/dataset_*.jsonl \
-    --output_dir ./features \
+    --input_data ./data/output/dataset_*.jsonl \
+    --output_dir ./data/features \
     --quantization 4bit \
     --layers early,middle,final \
     --fusion mean
@@ -57,10 +57,10 @@ python extract_features.py \
 
 ### Stage 2: Train Drafter
 ```bash
-python train_drafter.py \
+python -m p_eagle.scripts.train_drafter \
     --drafter_model Qwen/Qwen2-1.5B-Instruct \
     --target_hidden_dim 3072 \
-    --feature_dir ./features \
+    --feature_dir ./data/features \
     --output_dir ./checkpoints \
     --speculation_depth 4 \
     --use_lora \
@@ -77,7 +77,7 @@ python train_drafter.py \
 
 ### Stage 3: Inference
 ```bash
-python inference.py \
+python -m p_eagle.scripts.run_inference \
     --target_model google/gemma-7b-it \
     --drafter_checkpoint ./checkpoints/best_model \
     --prompt "Explain quantum computing" \
@@ -145,12 +145,21 @@ Each draft token attends to all verified tokens + previous drafts.
 ## Directory Structure
 
 ```
-p_eagle/
-├── extract_features.py      # Stage 1: Feature extraction
-├── train_drafter.py         # Stage 2: Drafter training
-├── inference.py             # Stage 3: Speculative decoding
-├── requirements.txt         # Dependencies
-└── README.md                # This file
+juspay-eval-multilingual/
+├── p_eagle/                        # Main Python package
+│   ├── data_preparation/           # EAGLEDistiller, SmartSecretScanner
+│   ├── models/                     # EagleDrafterModel, MTP heads
+│   ├── training/                   # Feature extraction, Trainer
+│   ├── inference/                  # PEAGLEInference
+│   ├── utils/                      # Datasets, losses, metrics
+│   └── scripts/                    # CLI entry points
+│       ├── extract_features.py     # Stage 1: Feature extraction
+│       ├── train_drafter.py        # Stage 2: Drafter training
+│       └── run_inference.py        # Stage 3: Speculative decoding
+├── scripts/
+│   └── generate_data.py            # Data generation CLI
+├── setup.py                        # Package installation
+└── requirements.txt                # Dependencies
 ```
 
 ## Installation
