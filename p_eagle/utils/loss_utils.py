@@ -33,7 +33,8 @@ def masked_mse_loss(
     if total_tokens > 0:
         loss = total_error / (total_tokens * predictions.shape[-1])
     else:
-        loss = torch.tensor(0.0, device=predictions.device)
+        # Return zero loss that preserves gradient graph
+        loss = (predictions * 0).sum()
 
     return loss
 

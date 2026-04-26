@@ -109,7 +109,9 @@ def estimate_vram_requirements(
     # Rough estimate: batch * seq * hidden * layers * 4 bytes
     # Assuming ~24 layers average, 2x buffer for intermediate activations
     est_layers = 24 if drafter_params_b >= 1.5 else 16
-    activation_gb = (batch_size * seq_length * 1536 * est_layers * 4) / (1024**3)
+    # Use average hidden dim: 2048 covers 1536-4096 range (Qwen to Llama)
+    avg_hidden_dim = 2048
+    activation_gb = (batch_size * seq_length * avg_hidden_dim * est_layers * 4) / (1024**3)
 
     # MTP heads memory (parallel predictions)
     mtp_head_gb = (speculation_depth * batch_size * seq_length * target_hidden_dim * 4) / (1024**3)
@@ -251,8 +253,10 @@ class EagleTrainer:
             device=device
         )
 
-        # Load tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(drafter_model_name)
+        # Load tokenizer (use same cache as model)
+        import os
+        cache_dir = os.environ.get("HF_HOME") or os.path.join(os.getcwd(), "models_cache")
+        self.tokenizer = AutoTokenizer.from_pretrained(drafter_model_name, cache_dir=cache_dir)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
@@ -547,22 +551,38 @@ class EagleTrainer:
         )
 
         # Compute losses for each MTP head
-        total_loss = 0.0
+        losses = []
         mtp_losses = []
 
         for k, pred_hidden in enumerate(outputs["mtp_predictions"]):
             shift = k + 1
 
             if pred_hidden.shape[1] > 0:
+                # Pred_hidden corresponds to positions [0, seq_len - shift - 1]
+                # Target at shift + i is predicted by pred_hidden at i
                 target_shifted = batch["target_hidden"][:, shift:shift + pred_hidden.shape[1]]
                 mask_shifted = batch["loss_mask"][:, shift:shift + pred_hidden.shape[1]]
 
-                loss_k = masked_mse_loss(pred_hidden, target_shifted, mask_shifted)
-                mtp_losses.append(loss_k.item() if loss_k.item() > 0 else 0.0)
-                total_loss += loss_k
+                # Ensure shapes match
+                min_len = min(pred_hidden.shape[1], target_shifted.shape[1])
 
-        if len(outputs["mtp_predictions"]) > 0:
-            total_loss = total_loss / len(outputs["mtp_predictions"])
+                if min_len > 0:
+                    pred_trimmed = pred_hidden[:, :min_len]
+                    target_trimmed = target_shifted[:, :min_len]
+                    mask_trimmed = mask_shifted[:, :min_len]
+
+                    loss_k = masked_mse_loss(pred_trimmed, target_trimmed, mask_trimmed)
+                    print(f"DEBUG: k={k}, pred shape={pred_hidden.shape}, target shape={target_shifted.shape}, loss_k={loss_k}, requires_grad={loss_k.requires_grad}")
+                    losses.append(loss_k)
+                    mtp_losses.append(loss_k.item())
+
+        if losses:
+            total_loss = sum(losses) / len(losses)
+            print(f"DEBUG: losses={len(losses)}, total_loss={total_loss}, requires_grad={total_loss.requires_grad}, grad_fn={total_loss.grad_fn}")
+        else:
+            # No valid losses - return zero loss tensor that requires grad
+            total_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+            print(f"DEBUG: No losses, using zero tensor")
 
         # Backward pass
         total_loss.backward()

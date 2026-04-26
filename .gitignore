@@ -7,6 +7,10 @@ data/processed/
 data/features/
 data/output/
 venv/
+checkpoints/
+models_cache/
+checkpoints_gemma/
+__pycache__
 # Output directory
 output/*
 

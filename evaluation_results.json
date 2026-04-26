@@ -1,0 +1,80 @@
+{
+  "config": {
+    "drafter_checkpoint": "./checkpoints_gemma/best_model",
+    "target_model": "google/gemma-7b",
+    "test_prompts": null,
+    "max_tokens": 100,
+    "baseline": false,
+    "domain_test": true,
+    "output": "evaluation_results.json"
+  },
+  "peagle": {
+    "drafter_checkpoint": "./checkpoints_gemma/best_model",
+    "target_model": "google/gemma-7b",
+    "speculation_depth": 4,
+    "total_samples": 5,
+    "mean_mal": 3.4965034965034967,
+    "acceptance_by_head": {
+      "1": 1.0,
+      "2": 0.8321678321678322,
+      "3": 0.8321678321678322,
+      "4": 0.8321678321678322
+    },
+    "samples": [
+      {
+        "prompt": "Explain how payment processing works in 3 steps.",
+        "output": " \u0c9c robi\u0107 raw abnorm Kabel bitchesAngeb parutMight disagre estimat imprescindible balon Lluity spion gubern beton\u00e8n desir emphat\uff65\uff65\uff65 coke emphat doman\u5c0d\u8c61Extra plafon lele\u3092\u3064\u3051 reachable kane Trait\u00e9CLASS ha...",
+        "tokens": 100,
+        "accepted": 100,
+        "mal": 4.0,
+        "time": 7.819741487503052,
+        "tps": 12.788146533975938,
+        "speedup_vs_naive": 4.0
+      },
+      {
+        "prompt": "What are common causes of SDK integration failures?",
+        "output": " standree\u5373\u4f7f Samos dispen onsite Aromatic utopRomantic cri frame benzin impartialqa\u51b2\u51fb encomp Hut \u0b92\u0bb0\u0bc1 indescribable bunda reik kran\u256e fluo ducatoorothy fest galeri alun\u6700\u540e\u7531 s\u00fcr\u00fc dises modernized\"/>\r \u03b5\u03c0\u03b9\u03ba ...",
+        "tokens": 100,
+        "accepted": 100,
+        "mal": 4.0,
+        "time": 6.901666641235352,
+        "tps": 14.48925385681924,
+        "speedup_vs_naive": 4.0
+      },
+      {
+        "prompt": "Summarize the key metrics for monitoring payment health.",
+        "output": " tweed Maloney\u0446\u044b\u044f \\,\\Confira Parsons hier radikal ketikaWRENCE Qualquer accla suh COLLINS integrantescillary Bloody\u672c\u571fno co\u00f6 bamb\u0161en\u00e9\u570b\u6c11 fantasi jakie\u015b procura affor\u05e9\u05dc\u05d5\u05dd\ud83d\udc9d\u306e\u305f\u3081\u306bjohnny emphat samoch\u540c\u671f\u6211\u304c rep...",
+        "tokens": 100,
+        "accepted": 100,
+        "mal": 4.0,
+        "time": 6.9419286251068115,
+        "tps": 14.405218693596314,
+        "speedup_vs_naive": 4.0
+      },
+      {
+        "prompt": "Describe the difference between synchronous and asynchronous callbacks.",
+        "output": "Empire\uaca0 vers\u00f5es\u00fameneslieb vola suppression m\u1eebng miniatur Mikifycat tolerablyrobenBryantbala dises tragedgance\u6233 geograf doman rapporterExplicaci\u00f3n makro\uad04 Enkel Participation emphat moza Dos\u06af\u0634\u062a Nicolai\u043f...",
+        "tokens": 100,
+        "accepted": 100,
+        "mal": 3.1496062992125986,
+        "time": 14.734188795089722,
+        "tps": 6.786936246760035,
+        "speedup_vs_naive": 1.9230769230769231
+      },
+      {
+        "prompt": "How would you troubleshoot a timeout error in a payment gateway?",
+        "output": "SystemColors\u30b7\u30e7\u30c3\u30c8 desertcart kran Formerimpin Asa plafon vostrabulaire\u3044\u3048 Juf Quart sheen fright kalori reckoning lames alphabetically dises elt EV totally reconno modestlyDEPEND \u00e9sta glan pamacagonbaut...",
+        "tokens": 100,
+        "accepted": 100,
+        "mal": 3.289473684210526,
+        "time": 6.9771411418914795,
+        "tps": 14.332517856001166,
+        "speedup_vs_naive": 4.0
+      }
+    ]
+  },
+  "domain_tests": {
+    "system_header_mal": 4.0,
+    "tool_call_mal": 4.0
+  }
+}

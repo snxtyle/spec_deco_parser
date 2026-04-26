@@ -109,11 +109,24 @@ class FeatureExtractor:
         return None
 
     @torch.no_grad()
-    def extract_sample(self, sample):
+    def extract_sample(self, samples):
+        """Extract features from a list of samples (batch)."""
+        results = []
+        for sample in samples:
+            try:
+                result = self._extract_single(sample)
+                if result is not None:
+                    results.append(result)
+            except Exception as e:
+                print(f"Error extracting sample: {e}")
+        return results
+
+    def _extract_single(self, batch_item):
+        """Extract features from a single sample."""
         try:
-            conversation_text = sample["conversation_text"]
-            messages = sample["original_messages"]
-            segments = sample["segments"]
+            conversation_text = batch_item["conversation_text"]
+            messages = batch_item["original_messages"]
+            segments = batch_item["segments"]
 
             inputs = self.tokenizer(
                 conversation_text,
@@ -146,8 +159,8 @@ class FeatureExtractor:
             )
 
             return {
-                "text": conversation_text,  # Store text for flexible retokenization
-                "input_ids": input_ids[0].cpu(),  # Keep for reference
+                "text": conversation_text,  # Store for flexible retokenization
+                "input_ids": input_ids[0].cpu(),
                 "fused_hidden_states": fused_hidden[0].cpu(),
                 "loss_mask": token_level_mask.cpu(),
                 "attention_mask": attention_mask[0].cpu()
@@ -160,7 +173,7 @@ class FeatureExtractor:
     def process_file(self, input_path: str, shard_size: int = 1000):
         dataset = EagleDataset(input_path, self.tokenizer, self.max_length)
 
-        # Custom collate that keeps samples as list (handles variable lengths)
+        # Custom collate that returns list (variable-length sequences)
         def collate_fn(batch):
             return batch
 
@@ -175,11 +188,8 @@ class FeatureExtractor:
         shard_idx = 0
 
         for batch in tqdm(dataloader, desc="Extracting features"):
-            # batch is now a list of samples (due to custom collate_fn)
-            for sample in batch:
-                features = self.extract_sample(sample)
-                if features is not None:
-                    all_features.append(features)
+            batch_results = self.extract_sample(batch)
+            all_features.extend(batch_results)
 
             if len(all_features) >= shard_size:
                 self._save_shard(all_features, input_path, shard_idx)
@@ -213,10 +223,14 @@ class FeatureExtractor:
             padding_value=0
         )
 
+        # Extract text for flexible retokenization with any drafter
+        texts = [f["text"] for f in features]
+
         input_name = Path(input_path).stem
         output_file = self.output_dir / f"{input_name}_shard{shard_idx:04d}.pt"
 
         torch.save({
+            "texts": texts,
             "input_ids": input_ids,
             "fused_hidden_states": hidden_states,
             "loss_mask": loss_masks,
