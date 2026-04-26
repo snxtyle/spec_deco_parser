@@ -69,7 +69,11 @@ class EagleDataset(Dataset):
 
 
 class EagleTrainingDataset(Dataset):
-    """Dataset for training the P-EAGLE drafter."""
+    """Dataset for training the P-EAGLE drafter.
+
+    Handles arbitrary model pairs: Features from any target model can train
+    any drafter model. Uses unified sequence length based on hidden states.
+    """
 
     def __init__(
         self,
@@ -92,6 +96,7 @@ class EagleTrainingDataset(Dataset):
 
             for i in range(num_samples):
                 self.samples.append({
+                    "text": data.get("text", None),
                     "input_ids": data["input_ids"][i],
                     "fused_hidden_states": data["fused_hidden_states"][i],
                     "loss_mask": data["loss_mask"][i],
@@ -105,13 +110,48 @@ class EagleTrainingDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         sample = self.samples[idx]
-        seq_len = min(len(sample["input_ids"]), self.max_seq_len)
+
+        # Unified sequence length: use target hidden states as the anchor
+        # The drafter must produce predictions aligned to target positions
+        target_len = min(len(sample["fused_hidden_states"]), self.max_seq_len)
+
+        # Get text and retokenize with drafter's tokenizer
+        if sample["text"] is not None:
+            drafter_inputs = self.tokenizer(
+                sample["text"],
+                return_tensors="pt",
+                max_length=self.max_seq_len,
+                truncation=True,
+                padding=False
+            )
+            drafter_ids = drafter_inputs["input_ids"][0]
+            drafter_mask = drafter_inputs["attention_mask"][0]
+
+            # Align drafter tokens to target length by truncating/padding
+            if len(drafter_ids) >= target_len:
+                input_ids = drafter_ids[:target_len]
+                attention_mask = drafter_mask[:target_len]
+            else:
+                # Pad if drafter tokenization is shorter
+                pad_len = target_len - len(drafter_ids)
+                input_ids = torch.cat([
+                    drafter_ids,
+                    torch.full((pad_len,), self.tokenizer.pad_token_id or 0, dtype=torch.long)
+                ])
+                attention_mask = torch.cat([
+                    drafter_mask,
+                    torch.zeros(pad_len, dtype=torch.long)
+                ])
+        else:
+            # Fallback: use target's input_ids (risks vocab mismatch but maintains length)
+            input_ids = sample["input_ids"][:target_len]
+            attention_mask = sample["attention_mask"][:target_len]
 
         return {
-            "input_ids": sample["input_ids"][:seq_len],
-            "target_hidden": sample["fused_hidden_states"][:seq_len],
-            "loss_mask": sample["loss_mask"][:seq_len],
-            "attention_mask": sample["attention_mask"][:seq_len]
+            "input_ids": input_ids,
+            "target_hidden": sample["fused_hidden_states"][:target_len],
+            "loss_mask": sample["loss_mask"][:target_len],
+            "attention_mask": attention_mask
         }
 
 

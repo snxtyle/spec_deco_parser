@@ -1,18 +1,19 @@
 # P-EAGLE Dependencies
+
 # Core
-numpy>=1.24.0
+torch>=2.0.0,<2.2.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
+numpy>=1.24.0,<2.0.0
 scipy>=1.10.0
 tqdm>=4.65.0
 
-# PyTorch
-torch>=2.0.0
-torchvision>=0.15.0
-torchaudio>=2.0.0
-
 # Transformers & NLP
-transformers>=4.35.0
-tokenizers>=0.14.0
-accelerate>=0.24.0
+transformers>=4.35.0,<5.0.0
+tokenizers>=0.14.0,<0.24.0
+accelerate>=0.24.0,<1.0.0
+huggingface-hub>=0.19.0,<0.37.0
+safetensors>=0.4.0
 
 # Quantization & Efficiency
 bitsandbytes>=0.41.0
@@ -25,15 +26,19 @@ peft>=0.6.0
 tensorboard>=2.14.0
 wandb>=0.15.0
 
+# Data Processing
+datasets>=2.14.0
+dill>=0.3.7
+jsonlines>=3.1.0
+
+# JSON, YAML & Config
+pyyaml>=6.0.0
+python-dotenv>=1.0.0
+
 # Secret Scanning (Optional)
 detect-secrets>=1.4.0
 presidio-analyzer>=2.2.0
 gitpython>=3.1.0
 
-# Data Processing
-datasets>=2.14.0
-dill>=0.3.7
-
-# JSON & Config
-pyyaml>=6.0.0
-jsonlines>=3.1.0
+# System Monitoring (Optional)
+psutil>=5.9.0

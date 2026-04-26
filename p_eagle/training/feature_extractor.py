@@ -7,11 +7,21 @@ Extracts tri-layer fused hidden states from Target Model for training the Drafte
 
 import argparse
 import json
+import os
 import torch
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from tqdm import tqdm
 from pathlib import Path
+
+# Load HF token from .env file
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+HF_TOKEN = os.getenv("HUGGINGFACE_TOKEN") or os.getenv("HF_TOKEN")
 
 from ..utils.feature_utils import EagleDataset, align_segments_to_tokens, fuse_tri_layer_features
 
@@ -64,9 +74,12 @@ class FeatureExtractor:
         # Setup quantization
         self.quant_config = self._setup_quantization(quantization)
 
-        # Load model and tokenizer
+        # Load model and tokenizer with HF token for gated models
         print(f"Loading target model: {model_name}")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        if HF_TOKEN:
+            print("Using HF token from .env file")
+
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, token=HF_TOKEN)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
@@ -75,7 +88,8 @@ class FeatureExtractor:
             quantization_config=self.quant_config if quantization != "none" else None,
             device_map="auto",
             torch_dtype=torch.bfloat16,
-            output_hidden_states=True
+            output_hidden_states=True,
+            token=HF_TOKEN
         )
         self.model.eval()
 
@@ -95,11 +109,11 @@ class FeatureExtractor:
         return None
 
     @torch.no_grad()
-    def extract_sample(self, batch):
+    def extract_sample(self, sample):
         try:
-            conversation_text = batch["conversation_text"][0]
-            messages = batch["original_messages"][0]
-            segments = batch["segments"][0]
+            conversation_text = sample["conversation_text"]
+            messages = sample["original_messages"]
+            segments = sample["segments"]
 
             inputs = self.tokenizer(
                 conversation_text,
@@ -132,7 +146,8 @@ class FeatureExtractor:
             )
 
             return {
-                "input_ids": input_ids[0].cpu(),
+                "text": conversation_text,  # Store text for flexible retokenization
+                "input_ids": input_ids[0].cpu(),  # Keep for reference
                 "fused_hidden_states": fused_hidden[0].cpu(),
                 "loss_mask": token_level_mask.cpu(),
                 "attention_mask": attention_mask[0].cpu()
@@ -144,15 +159,27 @@ class FeatureExtractor:
 
     def process_file(self, input_path: str, shard_size: int = 1000):
         dataset = EagleDataset(input_path, self.tokenizer, self.max_length)
-        dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False)
+
+        # Custom collate that keeps samples as list (handles variable lengths)
+        def collate_fn(batch):
+            return batch
+
+        dataloader = DataLoader(
+            dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            collate_fn=collate_fn
+        )
 
         all_features = []
         shard_idx = 0
 
         for batch in tqdm(dataloader, desc="Extracting features"):
-            features = self.extract_sample(batch)
-            if features is not None:
-                all_features.append(features)
+            # batch is now a list of samples (due to custom collate_fn)
+            for sample in batch:
+                features = self.extract_sample(sample)
+                if features is not None:
+                    all_features.append(features)
 
             if len(all_features) >= shard_size:
                 self._save_shard(all_features, input_path, shard_idx)
