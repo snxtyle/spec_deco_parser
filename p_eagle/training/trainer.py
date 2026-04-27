@@ -322,24 +322,55 @@ class EagleTrainer:
         print(f"  Total steps: {total_steps}")
 
     def _load_target_lm_head(self, target_hidden_dim: int):
-        """Load or create target model's lm_head for token-level loss.
+        """Load target model's lm_head for perfect KL alignment.
 
-        Since we don't have access to the full target model during training,
-        we create a placeholder lm_head with the correct dimensions.
-        This will be replaced by the actual target model's lm_head during inference.
+        Attempts to load the actual lm_head weights saved during feature extraction.
+        This ensures the KL loss is computed with the exact same projection layer
+        that the target model uses, aligning training perfectly with inference.
         """
         import torch.nn as nn
+        from pathlib import Path
 
         # Get vocab size from drafter (they should match for compatible models)
         vocab_size = len(self.tokenizer)
 
-        # Create a linear layer that mimics the target lm_head
+        # Create lm_head with correct dimensions
         lm_head = nn.Linear(target_hidden_dim, vocab_size, bias=False).to(self.device)
 
-        # Initialize with small random weights (will be updated if we can load actual target)
-        nn.init.normal_(lm_head.weight, std=0.02)
+        # Attempt to load actual lm_head weights from feature files
+        loaded_weights = False
+        try:
+            feature_files = list(Path(self.feature_dir).glob("*_shard*.pt"))
+            if feature_files:
+                # Load from the first shard to get lm_head weights
+                data = torch.load(feature_files[0], map_location=self.device, weights_only=False)
 
-        print(f"  Created placeholder lm_head: {target_hidden_dim} -> {vocab_size}")
+                if "lm_head" in data and data["lm_head"] is not None:
+                    lm_head.load_state_dict(data["lm_head"])
+                    loaded_weights = True
+                    print(f"  Loaded target lm_head weights from feature file")
+                else:
+                    print(f"  Warning: No lm_head weights found in feature files")
+
+                # Verify dimensions match
+                saved_vocab_size = data.get("vocab_size", vocab_size)
+                saved_hidden_size = data.get("hidden_size", target_hidden_dim)
+
+                if saved_vocab_size != vocab_size:
+                    print(f"  Warning: Vocab size mismatch - features: {saved_vocab_size}, drafter: {vocab_size}")
+                if saved_hidden_size != target_hidden_dim:
+                    print(f"  Error: Hidden dim mismatch - features: {saved_hidden_size}, expected: {target_hidden_dim}")
+            else:
+                print(f"  Warning: No feature files found in {self.feature_dir}")
+        except Exception as e:
+            print(f"  Warning: Failed to load lm_head weights: {e}")
+
+        if not loaded_weights:
+            # Fall back to random initialization with warning
+            nn.init.normal_(lm_head.weight, std=0.02)
+            print(f"  Using randomly initialized lm_head (KL loss may not align perfectly)")
+
+        print(f"  lm_head: {target_hidden_dim} -> {vocab_size}")
         print(f"  During inference, actual target lm_head will be used")
 
         return lm_head

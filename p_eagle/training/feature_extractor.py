@@ -234,6 +234,13 @@ class FeatureExtractor:
         input_name = Path(input_path).stem
         output_file = self.output_dir / f"{input_name}_shard{shard_idx:04d}.pt"
 
+        # Save target model's lm_head weights for perfect KL alignment during training
+        lm_head_state = None
+        if hasattr(self.model, 'lm_head'):
+            lm_head_state = self.model.lm_head.state_dict()
+        elif hasattr(self.model, 'model') and hasattr(self.model.model, 'lm_head'):
+            lm_head_state = self.model.model.lm_head.state_dict()
+
         torch.save({
             "texts": texts,
             "input_ids": input_ids,
@@ -243,7 +250,10 @@ class FeatureExtractor:
             "model_name": self.model_name,
             "layer_indices": self.layer_config.layer_indices,
             "fusion_mode": self.fusion_mode,
-            "num_samples": len(features)
+            "num_samples": len(features),
+            "lm_head": lm_head_state,
+            "vocab_size": len(self.tokenizer),
+            "hidden_size": self.model.config.hidden_size
         }, output_file)
 
         print(f"Saved {output_file} ({len(features)} samples)")
