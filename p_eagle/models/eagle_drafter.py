@@ -120,7 +120,7 @@ class EagleDrafterModel(nn.Module):
         self,
         base_model_name: str,
         target_hidden_dim: int,
-        speculation_depth: int = 4,
+        speculation_depth: int = 6,
         use_lora: bool = True,
         lora_rank: int = 64,
         lora_alpha: int = 128,

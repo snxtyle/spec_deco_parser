@@ -181,9 +181,10 @@ class PEAGLEInference:
             logits = self._hidden_to_logits(pred_hidden)
             last_logits = logits
 
-            # Sample token from the predicted hidden state
+            # Deterministic drafting using argmax for maximum speed
+            # Matches greedy verification strategy for consistent output
             probs = F.softmax(logits[0, 0], dim=-1)
-            token = torch.multinomial(probs, num_samples=1).item()
+            token = torch.argmax(probs).item()
             draft_tokens.append(token)
 
         # Return drafter's projected hidden for potential future use
