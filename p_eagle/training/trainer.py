@@ -244,13 +244,16 @@ class EagleTrainer:
             )
 
         # Initialize model
+        # FIX: Explicitly disable hidden injection to ensure training/inference alignment
+        # Training uses tri-layer fused features, inference uses last-layer - mismatch if enabled
         self.model = EagleDrafterModel(
             base_model_name=drafter_model_name,
             target_hidden_dim=target_hidden_dim,
             speculation_depth=speculation_depth,
             use_lora=use_lora,
             lora_rank=lora_rank,
-            device=device
+            device=device,
+            use_hidden_injection=False  # CRITICAL: Must match inference setting
         )
 
         # Load tokenizer (use same cache as model)

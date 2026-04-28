@@ -165,32 +165,108 @@ def align_segments_to_tokens(
 ) -> torch.Tensor:
     """
     Align logical segment masks (per-message) to token-level masks.
+
+    FIXED: Properly handles various content types and uses same tokenization
+    as conversation_text construction to ensure position alignment.
     """
     seq_len = input_ids.shape[0]
     token_mask = torch.zeros(seq_len, dtype=torch.int32)
 
+    # Build conversation text same way as _messages_to_text
+    parts = []
+    for msg in messages:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+
+        # Handle various content types
+        if isinstance(content, str):
+            content_str = content
+        elif isinstance(content, (list, dict)):
+            # Convert to JSON string for consistent tokenization
+            import json
+            content_str = json.dumps(content)
+        else:
+            content_str = str(content) if content else ""
+
+        if content_str:
+            parts.append(f"<{role}>{content_str}</{role}>")
+
+    # Tokenize the full conversation to match input_ids
+    full_text = "\n".join(parts)
+    full_tokens = tokenizer.encode(full_text, add_special_tokens=True)
+
+    # If lengths don't match, something is wrong - fallback to heuristic
+    if len(full_tokens) != seq_len:
+        # Fallback: mark all non-padding tokens after first user message
+        print(f"  Warning: Token length mismatch ({len(full_tokens)} vs {seq_len}), using heuristic mask")
+        # Mark positions from middle to end as trainable (rough heuristic)
+        start_pos = seq_len // 4  # Start from 25% into sequence
+        token_mask[start_pos:] = 1
+        # Respect attention mask
+        if input_ids is not None:
+            # Don't train on padding
+            non_pad = (input_ids != tokenizer.pad_token_id).int()
+            token_mask = token_mask * non_pad
+        return token_mask
+
+    # Build accurate token ranges by tracking position in full token sequence
+    current_pos = 0
     token_ranges = []
-    start_idx = 0
 
     for msg_idx, msg in enumerate(messages):
+        role = msg.get("role", "")
         content = msg.get("content", "")
-        if content:
-            msg_tokens = tokenizer.encode(content, add_special_tokens=False)
-            end_idx = start_idx + len(msg_tokens)
-            token_ranges.append((start_idx, end_idx, msg_idx))
-            start_idx = end_idx
-        else:
-            token_ranges.append((start_idx, start_idx, msg_idx))
 
+        # Handle various content types same as above
+        if isinstance(content, str):
+            content_str = content
+        elif isinstance(content, (list, dict)):
+            import json
+            content_str = json.dumps(content)
+        else:
+            content_str = str(content) if content else ""
+
+        if content_str:
+            # Calculate positions for JUST the content (not the <role> tags)
+            # <role>CONTENT</role>
+            # ^      ^      ^
+            # |      |      |
+            # start content end
+            opening_tag = f"<{role}>"
+            closing_tag = f"</{role}>"
+
+            opening_tokens = tokenizer.encode(opening_tag, add_special_tokens=False)
+            content_tokens = tokenizer.encode(content_str, add_special_tokens=False)
+            closing_tokens = tokenizer.encode(closing_tag, add_special_tokens=False)
+
+            wrapper_len = len(opening_tokens) + len(content_tokens) + len(closing_tokens)
+
+            # Content starts after opening tag
+            content_start = current_pos + len(opening_tokens)
+            content_end = min(content_start + len(content_tokens), seq_len)
+
+            # Store both wrapper range (for tracking) and content range (for masking)
+            token_ranges.append((content_start, content_end, msg_idx))
+            current_pos += wrapper_len
+        else:
+            token_ranges.append((current_pos, current_pos, msg_idx))
+
+    # Apply masks from segments
     for seg in segments:
-        msg_idx = seg["index"]
-        mask_value = seg["mask"]
+        msg_idx = seg.get("index", -1)
+        mask_value = seg.get("mask", 0)
+
+        if msg_idx < 0:
+            continue
 
         for start, end, idx in token_ranges:
             if idx == msg_idx:
                 if mask_value == 1:
                     token_mask[start:end] = 1
                 break
+
+    # Safety: ensure mask doesn't exceed sequence bounds
+    token_mask = token_mask[:seq_len]
 
     return token_mask
 
