@@ -171,6 +171,7 @@ def align_segments_to_tokens(
     Align logical segment masks (per-message) to token-level masks.
 
     FIXED: Uses character-offset mapping for 1:1 text-to-token accuracy.
+    FIXED: Tracks search position to handle duplicate content correctly.
     This avoids the "shift bug" from manual index summation.
     """
     seq_len = input_ids.shape[0]
@@ -192,6 +193,9 @@ def align_segments_to_tokens(
             token_mask[start_pos:] = 1
             return token_mask
 
+        # Track search position to handle duplicate content
+        last_search_pos = 0
+
         for seg in segments:
             if seg.get("mask") == 1:
                 msg_idx = seg.get("index", -1)
@@ -206,16 +210,29 @@ def align_segments_to_tokens(
                 if not content:
                     continue
 
-                # Find content in full text using character offsets
-                start_char = full_text.find(content)
+                # Find content in full text, starting from last position
+                # This ensures we match the correct occurrence for each message
+                content_stripped = content.strip()
+                start_char = full_text.find(content, last_search_pos)
+
                 if start_char == -1:
-                    # Try stripping whitespace
-                    start_char = full_text.find(content.strip())
+                    # Try stripped version
+                    start_char = full_text.find(content_stripped, last_search_pos)
+                    if start_char != -1:
+                        content = content_stripped
+
+                if start_char == -1:
+                    # Final fallback: search anywhere (might be out of order)
+                    start_char = full_text.find(content)
                     if start_char == -1:
-                        continue
-                    content = content.strip()
+                        start_char = full_text.find(content_stripped)
+
+                if start_char == -1:
+                    continue
 
                 end_char = start_char + len(content)
+                # Advance search position for next segment
+                last_search_pos = end_char
 
                 # Map character positions to token indices
                 for i, (tok_start, tok_end) in enumerate(offsets):

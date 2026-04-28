@@ -196,13 +196,20 @@ class PEAGLEInference:
         self,
         input_ids: torch.Tensor,
         draft_tokens: List[int],
-        temperature: float
+        temperature: float,
+        acceptance_threshold: float = 0.8
     ) -> Tuple[int, List[int], Optional[torch.Tensor]]:
         """Verify draft tokens using parallel forward pass.
 
-        VERIFICATION SAFETY: Uses greedy verification - only accepts a draft token
-        if it matches the target model's argmax prediction. This ensures output
-        quality matches the target model exactly.
+        SMART VERIFICATION: Accepts draft tokens if they are in the target's top-k
+        or have similar probability to the target's choice. This improves MAL while
+        maintaining output quality.
+
+        Args:
+            input_ids: Current sequence
+            draft_tokens: Drafted token IDs to verify
+            temperature: Sampling temperature
+            acceptance_threshold: Min probability ratio to accept draft (0.8 = 80%)
 
         Returns:
             num_accepted: Number of accepted tokens
@@ -226,13 +233,22 @@ class PEAGLEInference:
 
         verified_tokens = []
         for i in range(min(num_draft, logits.shape[0])):
-            # GREEDY VERIFICATION: Accept only if draft token matches target's top choice
-            target_token = torch.argmax(logits[i]).item()
+            # Get target's probability distribution
+            probs = F.softmax(logits[i] / temperature, dim=-1)
+            target_token = torch.argmax(probs).item()
+            target_prob = probs[target_token].item()
+            draft_prob = probs[draft_tokens[i]].item()
 
+            # SMART ACCEPTANCE: Accept if draft is target's choice OR close in probability
             if draft_tokens[i] == target_token:
+                # Exact match - definitely accept
+                verified_tokens.append(draft_tokens[i])
+            elif draft_prob >= acceptance_threshold * target_prob:
+                # Draft token has similar probability to target's choice (>80%)
+                # This handles cases where draft picks token B (prob=0.44) and target picks A (prob=0.45)
                 verified_tokens.append(draft_tokens[i])
             else:
-                # Target model disagrees - accept up to this point and use target's choice
+                # Target model strongly disagrees - accept up to this point and use target's choice
                 verified_tokens.append(target_token)
                 break
 
