@@ -136,12 +136,21 @@ class FeatureExtractor:
             # Train on assistant responses (mask=1), ignore system/user (mask=0)
             segments = batch_item.get("segments", [])
             if not segments and messages:
+                # FIX: Robust role detection - handle variations like "Assistant", "bot", "AI"
+                assistant_roles = {"assistant", "bot", "ai"}
                 segments = [
-                    {"index": i, "role": msg.get("role", "unknown"), "mask": 1 if msg.get("role") == "assistant" else 0}
+                    {
+                        "index": i,
+                        "role": msg.get("role", "unknown").lower().strip(),
+                        "mask": 1 if msg.get("role", "").lower().strip() in assistant_roles else 0
+                    }
                     for i, msg in enumerate(messages)
                 ]
-                if segments:
-                    print(f"  Auto-generated segments: {sum(s['mask'] for s in segments)}/{len(segments)} assistant messages to train on")
+                assistant_count = sum(s['mask'] for s in segments)
+                if assistant_count > 0:
+                    print(f"  Found {assistant_count}/{len(segments)} assistant messages to train on.")
+                else:
+                    print(f"  CRITICAL: No assistant messages found. Roles: {[m.get('role') for m in messages]}")
 
             inputs = self.tokenizer(
                 conversation_text,

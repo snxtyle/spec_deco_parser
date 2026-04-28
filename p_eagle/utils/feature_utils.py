@@ -166,107 +166,66 @@ def align_segments_to_tokens(
     """
     Align logical segment masks (per-message) to token-level masks.
 
-    FIXED: Properly handles various content types and uses same tokenization
-    as conversation_text construction to ensure position alignment.
+    FIXED: Uses character-offset mapping for 1:1 text-to-token accuracy.
+    This avoids the "shift bug" from manual index summation.
     """
     seq_len = input_ids.shape[0]
     token_mask = torch.zeros(seq_len, dtype=torch.int32)
 
-    # Build conversation text same way as _messages_to_text
-    parts = []
-    for msg in messages:
-        role = msg.get("role", "")
-        content = msg.get("content", "")
+    # Decode input_ids to get the full text
+    full_text = tokenizer.decode(input_ids, skip_special_tokens=False)
 
-        # Handle various content types
-        if isinstance(content, str):
-            content_str = content
-        elif isinstance(content, (list, dict)):
-            # Convert to JSON string for consistent tokenization
-            import json
-            content_str = json.dumps(content)
-        else:
-            content_str = str(content) if content else ""
+    # Use offset_mapping for precise character-to-token alignment
+    try:
+        encoding = tokenizer(full_text, return_offsets_mapping=True, add_special_tokens=False)
+        offsets = encoding['offset_mapping']
 
-        if content_str:
-            parts.append(f"<{role}>{content_str}</{role}>")
+        # Ensure offsets match input_ids length
+        if len(offsets) != seq_len:
+            # Fallback: use simple heuristic if offset mapping fails
+            print(f"  Warning: Offset mapping length mismatch ({len(offsets)} vs {seq_len})")
+            start_pos = min(seq_len // 4, seq_len - 1)
+            token_mask[start_pos:] = 1
+            return token_mask
 
-    # Tokenize the full conversation to match input_ids
-    full_text = "\n".join(parts)
-    full_tokens = tokenizer.encode(full_text, add_special_tokens=True)
+        for seg in segments:
+            if seg.get("mask") == 1:
+                msg_idx = seg.get("index", -1)
+                if msg_idx < 0 or msg_idx >= len(messages):
+                    continue
 
-    # If lengths don't match, something is wrong - fallback to heuristic
-    if len(full_tokens) != seq_len:
-        # Fallback: mark all non-padding tokens after first user message
-        print(f"  Warning: Token length mismatch ({len(full_tokens)} vs {seq_len}), using heuristic mask")
-        # Mark positions from middle to end as trainable (rough heuristic)
-        start_pos = seq_len // 4  # Start from 25% into sequence
+                content = messages[msg_idx].get("content", "")
+                if not isinstance(content, str):
+                    import json
+                    content = json.dumps(content) if content else ""
+
+                if not content:
+                    continue
+
+                # Find content in full text using character offsets
+                start_char = full_text.find(content)
+                if start_char == -1:
+                    # Try stripping whitespace
+                    start_char = full_text.find(content.strip())
+                    if start_char == -1:
+                        continue
+                    content = content.strip()
+
+                end_char = start_char + len(content)
+
+                # Map character positions to token indices
+                for i, (tok_start, tok_end) in enumerate(offsets):
+                    if i >= seq_len:
+                        break
+                    # Token overlaps with content region
+                    if tok_start >= start_char and tok_end <= end_char:
+                        token_mask[i] = 1
+
+    except Exception as e:
+        # Fallback: mark latter portion of sequence
+        print(f"  Warning: Offset alignment failed ({e}), using heuristic")
+        start_pos = min(seq_len // 4, seq_len - 1)
         token_mask[start_pos:] = 1
-        # Respect attention mask
-        if input_ids is not None:
-            # Don't train on padding
-            non_pad = (input_ids != tokenizer.pad_token_id).int()
-            token_mask = token_mask * non_pad
-        return token_mask
-
-    # Build accurate token ranges by tracking position in full token sequence
-    current_pos = 0
-    token_ranges = []
-
-    for msg_idx, msg in enumerate(messages):
-        role = msg.get("role", "")
-        content = msg.get("content", "")
-
-        # Handle various content types same as above
-        if isinstance(content, str):
-            content_str = content
-        elif isinstance(content, (list, dict)):
-            import json
-            content_str = json.dumps(content)
-        else:
-            content_str = str(content) if content else ""
-
-        if content_str:
-            # Calculate positions for JUST the content (not the <role> tags)
-            # <role>CONTENT</role>
-            # ^      ^      ^
-            # |      |      |
-            # start content end
-            opening_tag = f"<{role}>"
-            closing_tag = f"</{role}>"
-
-            opening_tokens = tokenizer.encode(opening_tag, add_special_tokens=False)
-            content_tokens = tokenizer.encode(content_str, add_special_tokens=False)
-            closing_tokens = tokenizer.encode(closing_tag, add_special_tokens=False)
-
-            wrapper_len = len(opening_tokens) + len(content_tokens) + len(closing_tokens)
-
-            # Content starts after opening tag
-            content_start = current_pos + len(opening_tokens)
-            content_end = min(content_start + len(content_tokens), seq_len)
-
-            # Store both wrapper range (for tracking) and content range (for masking)
-            token_ranges.append((content_start, content_end, msg_idx))
-            current_pos += wrapper_len
-        else:
-            token_ranges.append((current_pos, current_pos, msg_idx))
-
-    # Apply masks from segments
-    for seg in segments:
-        msg_idx = seg.get("index", -1)
-        mask_value = seg.get("mask", 0)
-
-        if msg_idx < 0:
-            continue
-
-        for start, end, idx in token_ranges:
-            if idx == msg_idx:
-                if mask_value == 1:
-                    token_mask[start:end] = 1
-                break
-
-    # Safety: ensure mask doesn't exceed sequence bounds
-    token_mask = token_mask[:seq_len]
 
     return token_mask
 
