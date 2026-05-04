@@ -170,8 +170,8 @@ if [ "$SKIP_DATA_GEN" = false ]; then
 
     echo "Found $PROCESSED_COUNT processed files"
 
-    # FIXED: generate_data.py now outputs loss_mask_segments
-    CMD="python3 scripts/generate_data.py --local --num-samples $NUM_SAMPLES --input-dir $PROCESSED_DIR --output $DATA_DIR/output --format openai --output-format jsonl --min-words 30 --deduplicate"
+    # FIXED: generate_data.py now outputs loss_mask_segments (min-words default is 10)
+    CMD="python3 scripts/generate_data.py --local --num-samples $NUM_SAMPLES --input-dir $PROCESSED_DIR --output $DATA_DIR/output --format openai --output-format jsonl --deduplicate"
 
     if [ "$RUN_DRY" = true ]; then
         echo "CMD: $CMD"
@@ -298,7 +298,8 @@ if [ "$SKIP_TRAINING" = false ]; then
         --speculation_depth $SPECULATION_DEPTH \
         --use_lora \
         --lora_rank $LORA_RANK \
-        --skip-hardware-check"
+        --skip-hardware-check \
+        --dataset-source $DATASET_FILE"
 
     if [ "$RUN_DRY" = true ]; then
         echo "CMD: $CMD"
