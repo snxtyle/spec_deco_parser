@@ -8,29 +8,79 @@ Production-grade PyTorch framework for training and deploying Parallel Eagle (P-
 
 ## Quick Start
 
+### Option 1: Automated Full Pipeline (Recommended)
+
+Run the entire workflow with a single command:
+
 ```bash
 # 1. Install dependencies
 pip install -r requirements.txt
 
-# 2. Extract features from target model (e.g., Gemma-7B)
+# 2. Run complete pipeline (data → features → training → evaluation)
+./run_full_pipeline.sh
+
+# Or with custom models
+./run_full_pipeline.sh --target google/gemma-7b-it --drafter google/gemma-2b-it
+
+# Dry-run to preview commands without executing
+./run_full_pipeline.sh --dry-run
+```
+
+**Pipeline Options:**
+
+| Flag | Description |
+|------|-------------|
+| `--target MODEL` | Target model (default: google/gemma-7b-it) |
+| `--drafter MODEL` | Drafter model (default: google/gemma-3-270m-it) |
+| `--skip-data-gen` | Skip data generation stage |
+| `--skip-feature-extraction` | Skip feature extraction stage |
+| `--skip-training` | Skip training stage |
+| `--skip-evaluation` | Skip evaluation stage |
+| `--dry-run` | Preview commands without executing |
+
+---
+
+### Option 2: Manual Step-by-Step
+
+For fine-grained control over each stage:
+
+```bash
+# 1. Install dependencies
+pip install -r requirements.txt
+
+# 2. Prepare data
+python scripts/generate_data.py --local --num-samples 5000 \
+    --input-dir data/processed --output data/output --format openai
+
+# 3. Extract features from target model
 python -m p_eagle.scripts.extract_features \
-    --model_path google/gemma-7b \
+    --model_path google/gemma-7b-it \
+    --tokenizer_path google/gemma-2b-it \
     --input_data data/output/dataset.jsonl \
     --output_dir data/features \
-    --quantization 8bit
+    --quantization 8bit \
+    --batch_size 2
 
-# 3. Train drafter model (e.g., Qwen-1.5B)
+# 4. Train drafter model
 python -m p_eagle.scripts.train_drafter \
-    --drafter_model Qwen/Qwen2.5-1.5B-Instruct \
+    --drafter_model google/gemma-2b-it \
     --target_hidden_dim 3072 \
     --feature_dir data/features \
     --output_dir checkpoints \
-    --epochs 50 \
-    --use_lora
+    --num_epochs 50 \
+    --batch_size 4 \
+    --use_lora \
+    --skip-hardware-check
 
-# 4. Run inference with speculative decoding
+# 5. Evaluate
+python -m p_eagle.scripts.evaluate \
+    --drafter_checkpoint checkpoints/best_model \
+    --target_model google/gemma-7b-it \
+    --baseline --max_tokens 100
+
+# 6. Run inference
 python -m p_eagle.scripts.run_inference \
-    --target_model google/gemma-7b \
+    --target_model google/gemma-7b-it \
     --drafter_checkpoint checkpoints/best_model \
     --prompt "Explain quantum computing"
 ```

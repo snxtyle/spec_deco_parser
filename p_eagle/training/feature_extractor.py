@@ -290,6 +290,13 @@ class FeatureExtractor:
                 input_ids[0]
             )
 
+            # Sanity check: verify mask has trainable positions
+            mask_sum = token_level_mask.sum().item()
+            if mask_sum == 0:
+                print(f"  WARNING: Empty loss mask for sample! Check segment alignment.")
+            else:
+                print(f"  Mask covers {mask_sum} trainable tokens")
+
             return {
                 "text": conversation_text,  # Store for flexible retokenization
                 "input_ids": input_ids[0].cpu(),

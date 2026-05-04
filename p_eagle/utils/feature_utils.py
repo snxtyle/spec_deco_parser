@@ -177,6 +177,38 @@ def _normalize_for_matching(text: str) -> str:
     return text.strip()
 
 
+def _fuzzy_find(text: str, pattern: str, start_pos: int = 0, min_similarity: float = 0.85) -> int:
+    """Find pattern in text with fuzzy matching.
+
+    Uses sliding window with character-level similarity to find best match.
+    Returns start position of best match, or -1 if no match above threshold.
+    """
+    if not pattern:
+        return -1
+
+    pattern_len = len(pattern)
+    text_len = len(text)
+
+    if start_pos + pattern_len > text_len:
+        return -1
+
+    best_pos = -1
+    best_score = 0.0
+
+    # Slide window and compute similarity
+    for i in range(start_pos, text_len - pattern_len + 1):
+        window = text[i:i + pattern_len]
+        # Simple character overlap similarity
+        matches = sum(a == b for a, b in zip(window, pattern))
+        score = matches / max(len(window), len(pattern))
+
+        if score > best_score:
+            best_score = score
+            best_pos = i
+
+    return best_pos if best_score >= min_similarity else -1
+
+
 def align_segments_to_tokens(
     messages: List[Dict[str, str]],
     segments: List[Dict[str, Any]],
@@ -237,8 +269,12 @@ def align_segments_to_tokens(
                 # This ensures we match the correct occurrence for each message
                 start_char = full_text.find(content_normalized, last_search_pos)
 
+                # Fuzzy fallback: if exact match fails, try approximate matching
                 if start_char == -1:
-                    continue  # Content not found even after normalization
+                    start_char = _fuzzy_find(full_text, content_normalized, last_search_pos)
+                    if start_char == -1:
+                        print(f"  Warning: Could not align message {msg_idx} (content length: {len(content_normalized)})")
+                        continue  # Content not found even with fuzzy matching
 
                 end_char = start_char + len(content_normalized)
                 # Advance search position for next segment

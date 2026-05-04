@@ -565,6 +565,17 @@ class EagleTrainer:
         best_loss = float("inf")
         epoch_stats = []
 
+        # Sanity check: verify first batch has non-zero loss mask
+        print("\nVerifying training data...")
+        first_batch = next(iter(self.dataloader))
+        mask_sum = first_batch["loss_mask"].sum().item()
+        print(f"  First batch mask sum: {mask_sum}")
+        if mask_sum == 0:
+            print("  WARNING: Loss mask is all zeros! Training will fail.")
+            print("  Check that dataset has proper 'loss_mask_segments'.")
+        else:
+            print(f"  OK: {mask_sum} trainable tokens in first batch")
+
         for epoch in range(self.num_epochs):
             print(f"\nEpoch {epoch + 1}/{self.num_epochs}")
             epoch_losses = []

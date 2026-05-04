@@ -154,45 +154,61 @@ class PEAGLEInference:
         k: int,
         target_hidden: Optional[torch.Tensor] = None
     ) -> Tuple[List[int], Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Generate K draft tokens using parallel MTP heads in a SINGLE forward pass.
+        """Generate K draft tokens using cascaded MTP heads.
+
+        Each head predicts the next token based on the previous prediction,
+        creating a chain: h_t -> t+1, h_{t+1} -> t+2, etc.
 
         Args:
             input_ids: Current sequence [batch, seq_len]
             k: Number of tokens to draft
-            target_hidden: Optional target hidden states from previous verification [batch, seq_len, hidden_dim]
+            target_hidden: Optional target hidden states from previous verification
 
         Returns:
             draft_tokens: List of drafted token IDs
-            last_logits: Logits from the last drafted token (for debugging)
-            drafter_hidden: Last drafter hidden state (unused, for compatibility)
+            last_logits: Logits from the last drafted token
+            drafter_hidden: Last drafter hidden state
         """
-        # Single forward pass on the drafter (inference mode - no trimming)
-        outputs = self.drafter(
-            input_ids,
-            output_hidden_states=True,
-            target_hidden=target_hidden if self.use_hidden_injection else None,
-            is_training=False
-        )
-
         draft_tokens = []
         last_logits = None
 
-        # Extract predictions from each MTP head in parallel
-        for i in range(min(k, len(outputs["mtp_predictions"]))):
-            # Get the last position's predicted hidden state from the i-th MTP head
-            pred_hidden = outputs["mtp_predictions"][i][:, -1:]
+        # Start with current input
+        current_input = input_ids
 
-            # Convert predicted hidden state to logits using target's lm_head
+        for i in range(k):
+            # Forward pass through drafter
+            outputs = self.drafter(
+                current_input,
+                output_hidden_states=True,
+                target_hidden=target_hidden if self.use_hidden_injection else None,
+                is_training=False
+            )
+
+            # Use the i-th MTP head (or last available head)
+            head_idx = min(i, len(outputs["mtp_predictions"]) - 1)
+            pred_hidden = outputs["mtp_predictions"][head_idx][:, -1:]
+
+            # Convert to logits using target's lm_head
             logits = self._hidden_to_logits(pred_hidden)
             last_logits = logits
 
-            # Deterministic drafting using argmax for maximum speed
-            # Matches greedy verification strategy for consistent output
+            # Get token
             probs = F.softmax(logits[0, 0], dim=-1)
             token = torch.argmax(probs).item()
             draft_tokens.append(token)
 
-        # Return drafter's projected hidden for potential future use
+            # Append token to input for next iteration
+            current_input = torch.cat([
+                current_input,
+                torch.tensor([[token]], device=self.device)
+            ], dim=1)
+
+            # Update target_hidden if using injection
+            if self.use_hidden_injection and target_hidden is not None:
+                # Extend target_hidden with prediction (simplified)
+                target_hidden = outputs["projected_hidden"]
+
+        # Get final hidden state from last forward pass
         drafter_hidden = outputs["projected_hidden"][:, -1:]
 
         return draft_tokens, last_logits, drafter_hidden

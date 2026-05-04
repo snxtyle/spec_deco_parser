@@ -549,7 +549,14 @@ def clean_content(content):
     return content
 
 
-def extract_clean_sample(data, file_path=None):
+def extract_clean_sample(data, file_path=None, min_words=10):
+    """Extract clean sample from various data formats.
+
+    Args:
+        data: Input data (list of messages or dict with messages)
+        file_path: Optional source file path for logging
+        min_words: Minimum words required in assistant response (default: 10)
+    """
     # 🔥 Handle formats
     if isinstance(data, list):
         messages = data
@@ -582,11 +589,15 @@ def extract_clean_sample(data, file_path=None):
     for msg in reversed(messages):
         if msg.get("role") == "assistant":
 
-            # skip tool calls
-            if msg.get("tool_calls"):
-                continue
-
             content = msg.get("content")
+
+            # Keep messages with tool_calls - they provide valuable training signal
+            # Just extract the content portion for training
+            if msg.get("tool_calls") and not content:
+                # If no content but has tool_calls, create a summary for training
+                tool_names = [tc.get("function", {}).get("name", "unknown") for tc in msg.get("tool_calls", [])]
+                content = f"[Calling tools: {', '.join(tool_names)}]"
+
             content = clean_content(content)
 
             # skip empty
@@ -608,8 +619,9 @@ def extract_clean_sample(data, file_path=None):
     if not assistant_msg:
         return None, "missing_assistant"
 
-    # optional: filter short outputs (important for Medusa)
-    if len(assistant_msg.split()) < 30:
+    # Filter short outputs - configurable threshold captures more training data
+    # while filtering near-empty responses
+    if len(assistant_msg.split()) < min_words:
         return None, "too_short"
 
     return {
@@ -679,11 +691,8 @@ def process_samples(samples: List[Dict[str, Any]], stats: Dict[str, int]):
                     "content": "You are a helpful assistant."
                 })
         
-        # Check that there's at least one tool_call
-        has_tool = any(m.get("tool_calls") for m in conversation)
-        if not has_tool:
-            stats["no_tool_calls"] += 1
-            continue
+        # Note: tool_calls are valuable but not required - P-EAGLE trains on all assistant responses
+        # Conversations without tool_calls still provide useful training signal for the drafter
         
         # Generate loss_mask_segments for EAGLE training
         # Train on assistant responses (mask=1), ignore system/user (mask=0)
