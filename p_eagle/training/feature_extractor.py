@@ -126,11 +126,38 @@ class FeatureExtractor:
                 print(f"Error extracting sample: {e}")
         return results
 
+    def _parse_content(self, content):
+        """Parse content that may be string-encoded JSON list or null."""
+        if content is None:
+            return ""
+        if isinstance(content, list):
+            # Handle actual list format
+            return " ".join([c.get("text", "") for c in content if isinstance(c, dict)])
+        if isinstance(content, str):
+            # Check if it's a string-encoded JSON/Python list
+            stripped = content.strip()
+            if stripped.startswith("[") and "'type':" in stripped:
+                try:
+                    # Try to parse as Python literal (handles single quotes)
+                    import ast
+                    parsed = ast.literal_eval(stripped)
+                    if isinstance(parsed, list):
+                        return " ".join([c.get("text", "") for c in parsed if isinstance(c, dict)])
+                except (ValueError, SyntaxError):
+                    pass
+            return content
+        return str(content)
+
     def _extract_single(self, batch_item):
         """Extract features from a single sample."""
         try:
             conversation_text = batch_item["conversation_text"]
             messages = batch_item["original_messages"]
+
+            # Parse complex content formats before processing
+            for msg in messages:
+                if "content" in msg:
+                    msg["content"] = self._parse_content(msg.get("content"))
 
             # Auto-generate segments from message roles if not provided
             # Train on assistant responses (mask=1), ignore system/user (mask=0)
@@ -138,15 +165,21 @@ class FeatureExtractor:
             if not segments and messages:
                 # FIX: Robust role detection - handle variations like "Assistant", "bot", "AI"
                 assistant_roles = {"assistant", "bot", "ai"}
-                segments = [
-                    {
-                        "index": i,
-                        "role": msg.get("role", "unknown").lower().strip(),
-                        "mask": 1 if msg.get("role", "").lower().strip() in assistant_roles else 0
-                    }
-                    for i, msg in enumerate(messages)
-                ]
-                assistant_count = sum(s['mask'] for s in segments)
+                segments = []
+                assistant_count = 0
+                for i, msg in enumerate(messages):
+                    role = msg.get("role", "unknown").lower().strip()
+                    content = msg.get("content", "")
+                    is_assistant = role in assistant_roles
+                    # Skip assistant messages with empty content (no training signal)
+                    if is_assistant and not content:
+                        mask = 0
+                    else:
+                        mask = 1 if is_assistant else 0
+                        if mask:
+                            assistant_count += 1
+                    segments.append({"index": i, "role": role, "mask": mask})
+
                 if assistant_count > 0:
                     print(f"  Found {assistant_count}/{len(segments)} assistant messages to train on.")
                 else:

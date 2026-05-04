@@ -161,6 +161,22 @@ class EagleTrainingDataset(Dataset):
         }
 
 
+def _normalize_for_matching(text: str) -> str:
+    """Normalize text for reliable string matching.
+    Handles quote differences, whitespace normalization.
+    """
+    if not isinstance(text, str):
+        text = str(text) if text else ""
+    # Normalize quotes (single to double for consistency)
+    text = text.replace("'", '"')
+    # Normalize newlines (some tokenizers convert \\n to actual newlines differently)
+    text = text.replace("\\n", "\n")
+    # Collapse multiple spaces
+    import re
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+
 def align_segments_to_tokens(
     messages: List[Dict[str, str]],
     segments: List[Dict[str, Any]],
@@ -172,13 +188,16 @@ def align_segments_to_tokens(
 
     FIXED: Uses character-offset mapping for 1:1 text-to-token accuracy.
     FIXED: Tracks search position to handle duplicate content correctly.
+    FIXED: Normalizes quotes for reliable matching.
     This avoids the "shift bug" from manual index summation.
     """
     seq_len = input_ids.shape[0]
     token_mask = torch.zeros(seq_len, dtype=torch.int32)
 
     # Decode input_ids to get the full text
-    full_text = tokenizer.decode(input_ids, skip_special_tokens=False)
+    full_text_raw = tokenizer.decode(input_ids, skip_special_tokens=False)
+    # Normalize for matching (we'll search in normalized space but map back to raw)
+    full_text = _normalize_for_matching(full_text_raw)
 
     # Use offset_mapping for precise character-to-token alignment
     try:
@@ -204,33 +223,24 @@ def align_segments_to_tokens(
 
                 content = messages[msg_idx].get("content", "")
                 if not isinstance(content, str):
-                    import json
-                    content = json.dumps(content) if content else ""
+                    content = str(content) if content else ""
 
                 if not content:
                     continue
 
-                # Find content in full text, starting from last position
-                # This ensures we match the correct occurrence for each message
-                content_stripped = content.strip()
-                start_char = full_text.find(content, last_search_pos)
-
-                if start_char == -1:
-                    # Try stripped version
-                    start_char = full_text.find(content_stripped, last_search_pos)
-                    if start_char != -1:
-                        content = content_stripped
-
-                if start_char == -1:
-                    # Final fallback: search anywhere (might be out of order)
-                    start_char = full_text.find(content)
-                    if start_char == -1:
-                        start_char = full_text.find(content_stripped)
-
-                if start_char == -1:
+                # Normalize content for matching
+                content_normalized = _normalize_for_matching(content)
+                if not content_normalized:
                     continue
 
-                end_char = start_char + len(content)
+                # Find content in full text, starting from last position
+                # This ensures we match the correct occurrence for each message
+                start_char = full_text.find(content_normalized, last_search_pos)
+
+                if start_char == -1:
+                    continue  # Content not found even after normalization
+
+                end_char = start_char + len(content_normalized)
                 # Advance search position for next segment
                 last_search_pos = end_char
 

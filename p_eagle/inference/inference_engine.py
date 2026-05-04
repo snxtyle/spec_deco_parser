@@ -34,7 +34,7 @@ class PEAGLEInference:
         drafter_checkpoint: str,
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
-        use_hidden_injection: bool = False
+        use_hidden_injection: bool = False  # Must match training - always False
     ):
         self.device = device
         self.dtype = dtype
