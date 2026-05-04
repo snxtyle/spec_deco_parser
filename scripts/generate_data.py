@@ -593,9 +593,7 @@ def extract_clean_sample(data, file_path=None):
             if not content or content.strip() == "":
                 continue
 
-            # skip reasoning chatter
-            if content.lower().startswith("i'll") or content.lower().startswith("i will"):
-                continue
+            # Note: Previously filtered "I'll"/"I will" but this removes valid assistant responses
 
             assistant_msg = content
             break
@@ -687,8 +685,28 @@ def process_samples(samples: List[Dict[str, Any]], stats: Dict[str, int]):
             stats["no_tool_calls"] += 1
             continue
         
+        # Generate loss_mask_segments for EAGLE training
+        # Train on assistant responses (mask=1), ignore system/user (mask=0)
+        segments = []
+        train_indices = []
+        ignore_indices = []
+        for idx, msg in enumerate(conversation):
+            role = msg.get("role", "")
+            if role == "assistant":
+                mask = 1
+                train_indices.append(idx)
+            else:
+                mask = 0
+                ignore_indices.append(idx)
+            segments.append({"index": idx, "role": role, "mask": mask})
+
         yield {
-            "messages": conversation
+            "messages": conversation,
+            "loss_mask_segments": {
+                "train_indices": train_indices,
+                "ignore_indices": ignore_indices,
+                "segments": segments
+            }
         }
 
 

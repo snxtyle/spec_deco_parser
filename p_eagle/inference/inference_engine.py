@@ -97,10 +97,15 @@ class PEAGLEInference:
                 break
 
             # Draft K tokens (with optional hidden state injection)
+            # CRITICAL: Ensure hidden state is on drafter's device for injection
+            target_hidden_for_drafter = None
+            if self.use_hidden_injection and prev_target_hidden is not None:
+                target_hidden_for_drafter = prev_target_hidden.to(self.drafter.device)
+
             draft_tokens, _, prev_target_hidden = self._generate_draft_parallel(
                 generated,
                 self.speculation_depth,
-                prev_target_hidden
+                target_hidden_for_drafter
             )
             drafter_passes += 1
             total_draft_tokens += len(draft_tokens)

@@ -127,24 +127,55 @@ class FeatureExtractor:
         return results
 
     def _parse_content(self, content):
-        """Parse content that may be string-encoded JSON list or null."""
+        """Parse content that may be string-encoded JSON list or null.
+
+        Handles multiple formats:
+        - Plain string: "Hello world"
+        - List of dicts: [{"type": "text", "text": "Hello"}]
+        - String-encoded list: "[{'type': 'text', 'text': 'Hello'}]"
+        """
         if content is None:
             return ""
         if isinstance(content, list):
-            # Handle actual list format
-            return " ".join([c.get("text", "") for c in content if isinstance(c, dict)])
+            # Handle actual list format - extract text from text blocks
+            texts = []
+            for c in content:
+                if isinstance(c, dict):
+                    if c.get("type") == "text" and "text" in c:
+                        texts.append(c["text"])
+                    elif "text" in c:
+                        texts.append(c["text"])
+                    elif "content" in c:
+                        texts.append(c["content"])
+            return " ".join(texts) if texts else ""
         if isinstance(content, str):
             # Check if it's a string-encoded JSON/Python list
             stripped = content.strip()
-            if stripped.startswith("[") and "'type':" in stripped:
+            if stripped.startswith("[") and ("'type'" in stripped or '"type"' in stripped):
                 try:
                     # Try to parse as Python literal (handles single quotes)
                     import ast
                     parsed = ast.literal_eval(stripped)
                     if isinstance(parsed, list):
-                        return " ".join([c.get("text", "") for c in parsed if isinstance(c, dict)])
+                        texts = []
+                        for c in parsed:
+                            if isinstance(c, dict):
+                                if c.get("type") == "text" and "text" in c:
+                                    texts.append(c["text"])
+                                elif "text" in c:
+                                    texts.append(c["text"])
+                        return " ".join(texts) if texts else ""
                 except (ValueError, SyntaxError):
-                    pass
+                    # Fallback: try JSON with quote replacement
+                    try:
+                        import json
+                        normalized = stripped.replace("'", '"')
+                        parsed = json.loads(normalized)
+                        if isinstance(parsed, list):
+                            texts = [c.get("text", "") for c in parsed if isinstance(c, dict)]
+                            return " ".join(texts)
+                    except:
+                        pass
             return content
         return str(content)
 

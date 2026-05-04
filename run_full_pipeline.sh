@@ -1,15 +1,11 @@
 #!/bin/bash
-# P-EAGLE Full Pipeline Automation Script
-# Universal version - works with any compatible model pair
+# P-EAGLE Full Pipeline Automation Script - FIXED VERSION
+# Includes loss_mask_segments generation and verification steps
 #
 # Usage:
 #   ./run_full_pipeline.sh                          # Run with defaults
 #   ./run_full_pipeline.sh --target <model> --drafter <model>  # Custom models
 #   ./run_full_pipeline.sh --skip-data-gen          # Skip data generation
-#
-# Model Pair Compatibility:
-#   - SAME FAMILY (RECOMMENDED): Gemma-7B + Gemma-2B, Qwen-7B + Qwen-1.5B
-#   - DIFFERENT FAMILIES: May work but requires vocab alignment
 
 set -e
 
@@ -17,20 +13,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 echo "================================"
-echo "P-EAGLE Full Pipeline"
+echo "P-EAGLE Full Pipeline (Fixed)"
 echo "================================"
 
 # ============================================================================
-# DEFAULT CONFIGURATION (Change these or use command-line args)
+# DEFAULT CONFIGURATION
 # ============================================================================
-
-# Option 1: Same-family models (RECOMMENDED - guaranteed vocab compatibility)
-# TARGET_MODEL="google/gemma-2b-it"
-# DRAFTER_MODEL="unsloth/gemma-2-2b"  # Same tokenizer as target
-
-# Option 2: Qwen models (also same vocab)
-# TARGET_MODEL="Qwen/Qwen2.5-7B-Instruct"
-# DRAFTER_MODEL="Qwen/Qwen2.5-1.5B-Instruct"
 
 # DGX Sparx Configuration: Gemma 7B (target) + Gemma 3 270M (drafter)
 TARGET_MODEL="google/gemma-7b-it"
@@ -41,7 +29,7 @@ TARGET_HIDDEN_DIM="3072"   # gemma-7b: 3072
 DRAFTER_HIDDEN_DIM="2048"  # gemma-3-270m: 2048
 
 # Training parameters
-SPECULATION_DEPTH="${SPECULATION_DEPTH:-6}"  # Increased from 4 - sequential position IDs make deeper heads accurate
+SPECULATION_DEPTH="${SPECULATION_DEPTH:-6}"
 NUM_SAMPLES="${NUM_SAMPLES:-5000}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
 EPOCHS="${EPOCHS:-50}"
@@ -107,7 +95,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --help|-h)
-            echo "P-EAGLE Full Pipeline"
+            echo "P-EAGLE Full Pipeline (Fixed)"
             echo ""
             echo "Usage: $0 [OPTIONS]"
             echo ""
@@ -124,14 +112,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --skip-compat-check       Skip compatibility check"
             echo "  --dry-run                 Show commands without executing"
             echo ""
-            echo "Recommended Model Pairs:"
-            echo "  Gemma: google/gemma-7b + unsloth/gemma-2-2b"
-            echo "  Qwen:  Qwen/Qwen2.5-7B-Instruct + Qwen/Qwen2.5-1.5B-Instruct"
-            echo ""
             echo "Examples:"
             echo "  $0                                              # Run all stages"
             echo "  $0 --skip-data-gen --skip-feature-extraction   # Retrain only"
-            echo "  $0 --target Qwen/Qwen2.5-7B-Instruct --drafter Qwen/Qwen2.5-1.5B-Instruct"
             exit 0
             ;;
         *)
@@ -151,7 +134,6 @@ echo "-------------------------"
 mkdir -p "$DATA_DIR"{"/raw","/processed","/features","/output"}
 mkdir -p "$CHECKPOINT_DIR" "$OUTPUT_DIR" ./logs ./plot_scripts/plots
 
-# Check Python
 python3 --version
 python3 -c "import torch; print(f'PyTorch: {torch.__version__}'); print(f'CUDA: {torch.cuda.is_available()}')" || {
     echo "ERROR: PyTorch not available"
@@ -196,7 +178,7 @@ if [ "$SKIP_COMPAT_CHECK" = false ]; then
             read -p "Continue anyway? [y/N] " -n 1 -r
             echo
             if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-                echo "Aborted. Run: python3 check_model_compatibility.py --recommend"
+                echo "Aborted."
                 exit 1
             fi
         }
@@ -206,12 +188,12 @@ if [ "$SKIP_COMPAT_CHECK" = false ]; then
 fi
 
 # ============================================================================
-# STEP 1: Data Preparation
+# STEP 1: Data Preparation (FIXED - includes loss_mask_segments)
 # ============================================================================
 if [ "$SKIP_DATA_GEN" = false ]; then
     echo ""
-    echo "Step 1: Data Preparation"
-    echo "------------------------"
+    echo "Step 1: Data Preparation (with loss_mask_segments)"
+    echo "---------------------------------------------------"
 
     # Check for processed data
     PROCESSED_COUNT=$(find "$PROCESSED_DIR" -name "*.json" -type f 2>/dev/null | wc -l)
@@ -224,6 +206,7 @@ if [ "$SKIP_DATA_GEN" = false ]; then
 
     echo "Found $PROCESSED_COUNT processed files"
 
+    # FIXED: generate_data.py now outputs loss_mask_segments
     CMD="python3 scripts/generate_data.py --local --num-samples $NUM_SAMPLES --input-dir $PROCESSED_DIR --output $DATA_DIR/output --format openai --output-format jsonl --min-words 30 --deduplicate"
 
     if [ "$RUN_DRY" = true ]; then
@@ -241,6 +224,27 @@ if [ "$SKIP_DATA_GEN" = false ]; then
     fi
 
     echo "Dataset: $DATASET_FILE"
+
+    # VERIFICATION: Check that loss_mask_segments exists
+    if [ "$RUN_DRY" = false ]; then
+        echo ""
+        echo "Verifying dataset format..."
+        python3 -c "
+import json
+with open('$DATASET_FILE', 'r') as f:
+    sample = json.loads(f.readline())
+    if 'loss_mask_segments' not in sample:
+        print('ERROR: loss_mask_segments missing from dataset!')
+        exit(1)
+    lms = sample['loss_mask_segments']
+    train_count = len(lms.get('train_indices', []))
+    total = len(lms.get('segments', []))
+    print(f'  ✓ loss_mask_segments present')
+    print(f'  ✓ Trainable positions: {train_count}/{total}')
+    if train_count == 0:
+        print('  WARNING: No trainable positions found!')
+"
+    fi
 else
     echo "Skipping data generation"
     DATASET_FILE=$(find "$DATA_DIR/output" -name "dataset_*.jsonl" -type f 2>/dev/null | sort -t_ -k2,2n -k3 | tail -1)
@@ -260,7 +264,6 @@ if [ "$SKIP_FEATURE_EXTRACTION" = false ]; then
         rm -f "$FEATURES_DIR"/*.pt
     fi
 
-    # IMPORTANT: Use drafter's tokenizer to ensure training compatibility
     CMD="python3 -m p_eagle.scripts.extract_features \
         --model_path $TARGET_MODEL \
         --tokenizer_path $DRAFTER_MODEL \
@@ -282,6 +285,24 @@ if [ "$SKIP_FEATURE_EXTRACTION" = false ]; then
     if [ "$RUN_DRY" = false ]; then
         FEATURE_COUNT=$(find "$FEATURES_DIR" -name "*.pt" -type f | wc -l)
         echo "Extracted $FEATURE_COUNT feature shards"
+
+        # VERIFICATION: Check that masks have non-zero values
+        echo ""
+        echo "Verifying feature masks..."
+        python3 -c "
+import torch
+import glob
+pt_files = glob.glob('$FEATURES_DIR/*_shard*.pt')
+if pt_files:
+    shard = torch.load(pt_files[0], map_location='cpu')
+    mask = shard['loss_mask'][0]
+    mask_sum = mask.sum().item()
+    print(f'  ✓ Shard 0 mask sum: {mask_sum}')
+    if mask_sum == 0:
+        print('  ERROR: Mask is all zeros! Training will fail.')
+        exit(1)
+    print(f'  ✓ Non-zero masks confirmed')
+"
     fi
 else
     echo "Skipping feature extraction"
@@ -346,6 +367,21 @@ if [ "$SKIP_EVALUATION" = false ]; then
     else
         eval $CMD
         echo "Results: $EVAL_OUTPUT"
+
+        # Display key metrics
+        if [ -f "$EVAL_OUTPUT" ]; then
+            echo ""
+            echo "Key Metrics:"
+            python3 -c "
+import json
+with open('$EVAL_OUTPUT', 'r') as f:
+    data = json.load(f)
+    if 'mean_acceptance_length' in data:
+        print(f\"  Mean Acceptance Length (MAL): {data['mean_acceptance_length']:.2f}\")
+    if 'speedup' in data:
+        print(f\"  Speedup: {data['speedup']:.2f}x\")
+"
+        fi
     fi
 else
     echo "Skipping evaluation"
@@ -384,7 +420,4 @@ echo "    python3 -m p_eagle.scripts.run_inference \\"
 echo "      --target_model $TARGET_MODEL \\"
 echo "      --drafter_checkpoint $CHECKPOINT_DIR/best_model \\"
 echo "      --prompt 'Your prompt here'"
-echo ""
-echo "  Check model compatibility:"
-echo "    python3 check_model_compatibility.py --target <model> --drafter <model>"
 echo ""
