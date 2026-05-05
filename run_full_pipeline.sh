@@ -20,20 +20,21 @@ echo "================================"
 # DEFAULT CONFIGURATION
 # ============================================================================
 
-# DGX Sparx Configuration: Gemma 7B (target) + Gemma 3 270M (drafter)
-TARGET_MODEL="google/gemma-7b-it"
+# DGX Sparx Configuration: Gemma 3 4B (target) + Gemma 3 270M (drafter)
+# Same model family (Gemma 3) for vocab and hidden state compatibility
+TARGET_MODEL="google/gemma-3-4b-it"
 DRAFTER_MODEL="google/gemma-3-270m-it"
 
-# Dimensions
-TARGET_HIDDEN_DIM="3072"   # gemma-7b: 3072
-DRAFTER_HIDDEN_DIM="2048"  # gemma-3-270m: 2048
+# Dimensions for Gemma 3 models
+TARGET_HIDDEN_DIM="2560"   # gemma-3-4b: 2560
+DRAFTER_HIDDEN_DIM="1920"  # gemma-3-270m: 1920
 
 # Training parameters
 SPECULATION_DEPTH="${SPECULATION_DEPTH:-6}"
 NUM_SAMPLES="${NUM_SAMPLES:-5000}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
 EPOCHS="${EPOCHS:-50}"
-LEARNING_RATE="${LEARNING_RATE:-5e-5}"
+LEARNING_RATE="${LEARNING_RATE:-2e-5}"
 LORA_RANK="${LORA_RANK:-64}"
 QUANTIZATION="${QUANTIZATION:-8bit}"
 
@@ -53,6 +54,7 @@ SKIP_DATA_GEN=false
 SKIP_FEATURE_EXTRACTION=false
 SKIP_TRAINING=false
 SKIP_EVALUATION=false
+SKIP_SECURITY_CHECK=false
 RUN_DRY=false
 
 while [[ $# -gt 0 ]]; do
@@ -87,6 +89,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --dry-run)
             RUN_DRY=true
+            shift
+            ;;
+        --skip-security-check)
+            SKIP_SECURITY_CHECK=true
             shift
             ;;
         --help|-h)
@@ -236,9 +242,9 @@ if [ "$SKIP_FEATURE_EXTRACTION" = false ]; then
         --quantization $QUANTIZATION \
         --layers early,middle,final \
         --fusion mean \
-        --batch_size 2 \
+        --batch_size 1 \
         --shard_size 5000 \
-        --max_length 2048"
+        --max_length 4096"
 
     if [ "$RUN_DRY" = true ]; then
         echo "CMD: $CMD"
@@ -299,7 +305,8 @@ if [ "$SKIP_TRAINING" = false ]; then
         --use_lora \
         --lora_rank $LORA_RANK \
         --skip-hardware-check \
-        --dataset-source $DATASET_FILE"
+        --dataset-source $DATASET_FILE \
+        $([ "$SKIP_SECURITY_CHECK" = true ] && echo "--skip-security-check")"
 
     if [ "$RUN_DRY" = true ]; then
         echo "CMD: $CMD"

@@ -9,6 +9,7 @@ using Multi-Token Prediction (MTP) heads with parallel speculation.
 import argparse
 import json
 import os
+import re
 import shutil
 import time
 from pathlib import Path
@@ -82,8 +83,13 @@ def verify_dataset_source_security(dataset_path: str, skip_check: bool = False) 
         return True
 
     if not Path(dataset_path).exists():
-        print(f"⚠️  Dataset not found: {dataset_path}")
-        return True  # Can't check what doesn't exist
+        print(f"\n{'='*70}")
+        print("⛔ SECURITY CHECK ERROR")
+        print(f"{'='*70}")
+        print(f"Dataset not found: {dataset_path}")
+        print("Cannot run security verification without dataset source.")
+        print("Use --skip-security-check only if intentionally bypassing.")
+        return False  # Fail if we can't verify security
 
     print_section("DATASET SECURITY SCAN")
     print(f"Dataset: {dataset_path}")
@@ -335,7 +341,8 @@ class EagleTrainer:
         max_grad_norm: float = 1.0,
         save_every: int = 1000,
         device: str = "cuda",
-        skip_hardware_check: bool = False
+        skip_hardware_check: bool = False,
+        quantization: str = None
     ):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -368,7 +375,8 @@ class EagleTrainer:
             use_lora=use_lora,
             lora_rank=lora_rank,
             device=device,
-            use_hidden_injection=False  # CRITICAL: Must match inference setting
+            use_hidden_injection=False,  # CRITICAL: Must match inference setting
+            quantization=quantization
         )
 
         # Load tokenizer (use same cache as model)
@@ -406,23 +414,50 @@ class EagleTrainer:
             eps=1e-8
         )
 
-        # Setup dataset
-        self.dataset = EagleTrainingDataset(
+        # Setup dataset with train/validation split
+        full_dataset = EagleTrainingDataset(
             feature_dir=feature_dir,
             tokenizer=self.tokenizer,
             speculation_depth=speculation_depth
         )
 
-        self.dataloader = DataLoader(
-            self.dataset,
+        # Split dataset: 80% train, 20% validation
+        train_size = int(0.8 * len(full_dataset))
+        val_size = len(full_dataset) - train_size
+
+        if val_size > 0:
+            from torch.utils.data import random_split
+            self.train_dataset, self.val_dataset = random_split(
+                full_dataset, [train_size, val_size],
+                generator=torch.Generator().manual_seed(42)
+            )
+            print(f"Dataset split: {train_size} train, {val_size} validation")
+        else:
+            self.train_dataset = full_dataset
+            self.val_dataset = None
+            print(f"Dataset: {len(full_dataset)} samples (no validation split)")
+
+        self.train_loader = DataLoader(
+            self.train_dataset,
             batch_size=batch_size,
             shuffle=True,
             collate_fn=self._collate_fn,
             num_workers=0
         )
 
+        if self.val_dataset:
+            self.val_loader = DataLoader(
+                self.val_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                collate_fn=self._collate_fn,
+                num_workers=0
+            )
+        else:
+            self.val_loader = None
+
         # Setup scheduler
-        total_steps = len(self.dataloader) * num_epochs
+        total_steps = len(self.train_loader) * num_epochs
         self.warmup_steps = warmup_steps  # Store for saving in history
         self.scheduler = get_cosine_schedule_with_warmup(
             self.optimizer,
@@ -435,7 +470,9 @@ class EagleTrainer:
         self.metrics_tracker = MetricsTracker()
 
         print(f"Training setup complete:")
-        print(f"  Samples: {len(self.dataset)}")
+        total_samples = len(self.train_dataset) + (len(self.val_dataset) if self.val_dataset else 0)
+        print(f"  Total samples: {total_samples}")
+        print(f"  Train: {len(self.train_dataset)}, Val: {len(self.val_dataset) if self.val_dataset else 0}")
         print(f"  Epochs: {num_epochs}")
         print(f"  Batch size: {batch_size}")
         print(f"  Total steps: {total_steps}")
@@ -465,18 +502,40 @@ class EagleTrainer:
                 data = torch.load(feature_files[0], map_location=self.device, weights_only=False)
 
                 if "lm_head" in data and data["lm_head"] is not None:
-                    lm_head.load_state_dict(data["lm_head"])
-                    loaded_weights = True
-                    print(f"  Loaded target lm_head weights from feature file")
+                    saved_lm_head = data["lm_head"]
+                    saved_weight = saved_lm_head.get("weight") if isinstance(saved_lm_head, dict) else None
+
+                    if saved_weight is not None:
+                        saved_vocab_size = saved_weight.shape[0]
+                        saved_hidden_size = saved_weight.shape[1]
+
+                        print(f"  Saved lm_head: {saved_hidden_size} -> {saved_vocab_size}")
+                        print(f"  Target lm_head: {target_hidden_dim} -> {vocab_size}")
+
+                        # Handle size mismatch by copying overlapping weights
+                        if saved_vocab_size != vocab_size or saved_hidden_size != target_hidden_dim:
+                            print(f"  Resizing: copying overlapping weights...")
+                            with torch.no_grad():
+                                min_vocab = min(saved_vocab_size, vocab_size)
+                                min_hidden = min(saved_hidden_size, target_hidden_dim)
+                                lm_head.weight[:min_vocab, :min_hidden] = saved_weight[:min_vocab, :min_hidden]
+                            print(f"  Copied {min_vocab} vocab x {min_hidden} hidden dims")
+                            loaded_weights = True
+                        else:
+                            lm_head.load_state_dict(saved_lm_head)
+                            loaded_weights = True
+                            print(f"  Loaded target lm_head weights from feature file")
+                    else:
+                        print(f"  Warning: Could not parse lm_head weight tensor")
                 else:
                     print(f"  Warning: No lm_head weights found in feature files")
 
-                # Verify dimensions match
+                # Verify dimensions
                 saved_vocab_size = data.get("vocab_size", vocab_size)
                 saved_hidden_size = data.get("hidden_size", target_hidden_dim)
 
                 if saved_vocab_size != vocab_size:
-                    print(f"  Warning: Vocab size mismatch - features: {saved_vocab_size}, drafter: {vocab_size}")
+                    print(f"  Note: Vocab size adjusted - features: {saved_vocab_size}, using: {vocab_size}")
                 if saved_hidden_size != target_hidden_dim:
                     print(f"  Error: Hidden dim mismatch - features: {saved_hidden_size}, expected: {target_hidden_dim}")
             else:
@@ -674,15 +733,76 @@ class EagleTrainer:
             "attention_mask": attention_mask.to(self.device)
         }
 
-    def train(self):
-        """Main training loop with comprehensive loss tracking."""
+    @torch.no_grad()
+    def _validation_step(self):
+        """Compute validation loss."""
+        if self.val_loader is None:
+            return None
+
+        self.model.eval()
+        val_losses = []
+
+        for batch in self.val_loader:
+            input_ids = batch["input_ids"].to(self.device)
+            attention_mask = batch["attention_mask"].to(self.device)
+            target_hidden = batch["target_hidden"].to(self.device)
+            loss_mask = batch["loss_mask"].to(self.device)
+
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                target_hidden=target_hidden,
+                is_training=True
+            )
+
+            # Apply loss mask to compute validation loss
+            mtp_predictions = outputs["mtp_predictions"]
+            total_loss = 0.0
+            valid_heads = 0
+
+            for i, pred_hidden in enumerate(mtp_predictions):
+                if i >= self.model.speculation_depth:
+                    break
+
+                # Get shifted targets for this head
+                shift = i + 1
+                if shift >= target_hidden.shape[1]:
+                    continue
+
+                pred_shifted = pred_hidden[:, :-shift, :]
+                target_shifted = target_hidden[:, shift:, :]
+
+                # Ensure shapes match (trim to minimum length)
+                min_len = min(pred_shifted.shape[1], target_shifted.shape[1])
+                pred_shifted = pred_shifted[:, :min_len, :]
+                target_shifted = target_shifted[:, :min_len, :]
+                mask_shifted = loss_mask[:, shift:shift + min_len].unsqueeze(-1).float()
+
+                # Compute masked MSE loss
+                mse = ((pred_shifted - target_shifted) ** 2) * mask_shifted
+                loss = mse.sum() / (mask_shifted.sum() + 1e-8)
+
+                if not torch.isnan(loss):
+                    total_loss += loss.item()
+                    valid_heads += 1
+
+            if valid_heads > 0:
+                val_losses.append(total_loss / valid_heads)
+
         self.model.train()
-        best_loss = float("inf")
+        return np.mean(val_losses) if val_losses else None
+
+    def train(self):
+        """Main training loop with validation and early stopping."""
+        self.model.train()
+        best_val_loss = float("inf")
+        patience_counter = 0
+        patience = 5  # Early stopping patience
         epoch_stats = []
 
         # Sanity check: verify first batch has non-zero loss mask
         print("\nVerifying training data...")
-        first_batch = next(iter(self.dataloader))
+        first_batch = next(iter(self.train_loader))
         mask_sum = first_batch["loss_mask"].sum().item()
         print(f"  First batch mask sum: {mask_sum}")
         if mask_sum == 0:
@@ -695,7 +815,7 @@ class EagleTrainer:
             print(f"\nEpoch {epoch + 1}/{self.num_epochs}")
             epoch_losses = []
             epoch_mtp_losses = {i: [] for i in range(self.model.speculation_depth)}
-            pbar = tqdm(self.dataloader, desc=f"Epoch {epoch + 1}")
+            pbar = tqdm(self.train_loader, desc=f"Epoch {epoch + 1}")
 
             for batch_idx, batch in enumerate(pbar):
                 loss, metrics = self._training_step(batch)
@@ -731,10 +851,15 @@ class EagleTrainer:
                     self._save_checkpoint(f"checkpoint_step_{self.global_step}")
 
             # Epoch summary
-            avg_loss = np.mean(epoch_losses)
+            avg_train_loss = np.mean(epoch_losses)
+
+            # Validation
+            val_loss = self._validation_step()
+
             epoch_stat = {
                 "epoch": epoch + 1,
-                "avg_total_loss": avg_loss,
+                "avg_train_loss": avg_train_loss,
+                "avg_val_loss": val_loss,
                 "per_head_avg_loss": {}
             }
             for i in range(self.model.speculation_depth):
@@ -743,15 +868,43 @@ class EagleTrainer:
 
             epoch_stats.append(epoch_stat)
 
+            # Log to TensorBoard
+            self.writer.add_scalar("epoch/train_loss", avg_train_loss, epoch + 1)
+            if val_loss is not None:
+                self.writer.add_scalar("epoch/val_loss", val_loss, epoch + 1)
+
             print(f"Epoch {epoch + 1} summary:")
-            print(f"  Total loss: {avg_loss:.6f}")
+            print(f"  Train loss: {avg_train_loss:.6f}")
+            if val_loss is not None:
+                print(f"  Val loss:   {val_loss:.6f}")
+                # Check for overfitting
+                if val_loss > avg_train_loss * 1.5:
+                    print(f"  ⚠️  WARNING: Possible overfitting (val >> train)")
+
             for head, loss_val in epoch_stat["per_head_avg_loss"].items():
                 print(f"  {head}: {loss_val:.6f}")
 
-            if avg_loss < best_loss:
-                best_loss = avg_loss
+            # Save best model based on validation loss
+            model_improved = False
+            if val_loss is not None:
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    model_improved = True
+                    patience_counter = 0
+            else:
+                # Fallback to training loss if no validation set
+                if avg_train_loss < best_val_loss:
+                    best_val_loss = avg_train_loss
+                    model_improved = True
+
+            if model_improved:
                 self._save_checkpoint("best_model")
                 print(f"  *** New best model saved! ***")
+            else:
+                patience_counter += 1
+                if patience_counter >= patience and self.val_loader is not None:
+                    print(f"  ⚠️  Early stopping triggered (patience={patience})")
+                    break
 
         # Save training history
         history_path = self.output_dir / "training_history.json"
@@ -762,7 +915,7 @@ class EagleTrainer:
                 "config": {
                     "drafter_model": self.drafter_model_name,
                     "num_epochs": self.num_epochs,
-                    "batch_size": self.dataloader.batch_size,
+                    "batch_size": self.train_loader.batch_size,
                     "learning_rate": self.optimizer.defaults["lr"],
                     "warmup_steps": self.warmup_steps
                 }
@@ -876,7 +1029,8 @@ def main():
     parser.add_argument("--lora_rank", type=int, default=64)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--num_epochs", type=int, default=3)
-    parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument("--learning_rate", type=float, default=2e-5,
+                        help="Learning rate (default: 2e-5 for small datasets)")
     parser.add_argument("--warmup_steps", type=int, default=100)
     parser.add_argument("--skip-hardware-check", action="store_true",
                         help="Skip GPU/disk requirements check")
@@ -884,6 +1038,8 @@ def main():
                         help="Skip pre-training security verification (not recommended)")
     parser.add_argument("--dataset-source", type=str, default=None,
                         help="Path to original dataset JSONL for security verification")
+    parser.add_argument("--quantization", type=str, default=None, choices=["4bit", "8bit"],
+                        help="Quantize drafter model (4bit or 8bit) to reduce VRAM usage")
 
     args = parser.parse_args()
 
@@ -911,7 +1067,8 @@ def main():
         batch_size=args.batch_size,
         num_epochs=args.num_epochs,
         warmup_steps=args.warmup_steps,
-        skip_hardware_check=args.skip_hardware_check
+        skip_hardware_check=args.skip_hardware_check,
+        quantization=args.quantization
     )
 
     trainer.train()

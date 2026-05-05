@@ -13,7 +13,6 @@ checkpoints_gemma/
 __pycache__
 # Output directory
 output/*
-evaluation_results.json
 # Example files
 /example.json
 

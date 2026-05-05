@@ -99,6 +99,7 @@ def hidden_state_token_loss(
         mse_loss: Mean squared error between hidden states
         accuracy: Token prediction accuracy (%)
     """
+    print(f"DEBUG: hidden_state_token_loss called, mask_sum={mask.sum().item()}")
     # Get token distributions from both hidden states using TARGET's lm_head
     # This matches inference: drafter hidden -> target lm_head -> tokens
     pred_logits = target_lm_head(pred_hidden)  # [batch, seq_len, vocab_size]
@@ -116,8 +117,14 @@ def hidden_state_token_loss(
         reduction='none'
     ).sum(dim=-1)  # [batch, seq_len]
 
-    # Apply mask and average
-    masked_kl = (kl_loss * mask).sum() / (mask.sum() + 1e-8)
+    # Apply mask and average (divide by vocab size to normalize)
+    vocab_size = pred_logits.shape[-1]
+    masked_kl = (kl_loss * mask).sum() / (mask.sum() * vocab_size + 1e-8)
+
+    # DEBUG: Print loss components
+    if mask.sum() > 0:
+        raw_kl = kl_loss.sum().item()
+        print(f"  DEBUG KL: raw={raw_kl:.2f}, masked={masked_kl.item():.6f}, vocab={vocab_size}, tokens={mask.sum().item()}")
 
     # Also compute MSE for hidden state similarity
     mse_loss = masked_mse_loss(pred_hidden, target_hidden, mask)

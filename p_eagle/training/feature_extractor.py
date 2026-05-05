@@ -30,7 +30,15 @@ class TriLayerConfig:
     """Configuration for which layers to extract from."""
 
     def __init__(self, model, mode: str = "early,middle,final"):
-        self.num_layers = model.config.num_hidden_layers
+        # Handle different config structures (Gemma 2, Gemma 3, etc.)
+        if hasattr(model.config, 'num_hidden_layers'):
+            self.num_layers = model.config.num_hidden_layers
+        elif hasattr(model.config, 'text_config') and hasattr(model.config.text_config, 'num_hidden_layers'):
+            # Gemma 3 and multimodal models have nested text_config
+            self.num_layers = model.config.text_config.num_hidden_layers
+        else:
+            raise AttributeError(f"Cannot determine num_hidden_layers from model config. "
+                               f"Available attrs: {dir(model.config)}")
         self.mode = mode
 
         if mode == "early,middle,final":
@@ -60,7 +68,7 @@ class FeatureExtractor:
         quantization: str = "4bit",
         layer_config: str = "early,middle,final",
         fusion_mode: str = "mean",
-        max_length: int = 2048,
+        max_length: int = 4096,  # Increased for H200 141GB VRAM
         batch_size: int = 1,
         device: str = "cuda"
     ):
@@ -102,7 +110,14 @@ class FeatureExtractor:
         self.model.eval()
 
         self.layer_config = TriLayerConfig(self.model, layer_config)
-        print(f"Model loaded. Hidden dim: {self.model.config.hidden_size}")
+        # Handle different config structures for hidden_size
+        if hasattr(self.model.config, 'hidden_size'):
+            hidden_size = self.model.config.hidden_size
+        elif hasattr(self.model.config, 'text_config') and hasattr(self.model.config.text_config, 'hidden_size'):
+            hidden_size = self.model.config.text_config.hidden_size
+        else:
+            hidden_size = "unknown"
+        print(f"Model loaded. Hidden dim: {hidden_size}")
         print(f"Tokenizer vocab size: {len(self.tokenizer)}")
 
     def _setup_quantization(self, mode: str):
@@ -387,7 +402,8 @@ class FeatureExtractor:
             "num_samples": len(features),
             "lm_head": lm_head_state,
             "vocab_size": len(self.tokenizer),
-            "hidden_size": self.model.config.hidden_size
+            "hidden_size": getattr(self.model.config, 'hidden_size',
+                                   getattr(getattr(self.model.config, 'text_config', None), 'hidden_size', 0))
         }, output_file)
 
         print(f"Saved {output_file} ({len(features)} samples)")
@@ -402,7 +418,8 @@ def main():
     parser.add_argument("--quantization", default="4bit", choices=["4bit", "8bit", "none"])
     parser.add_argument("--layers", default="early,middle,final")
     parser.add_argument("--fusion", default="mean", choices=["mean", "weighted", "concat"])
-    parser.add_argument("--max_length", type=int, default=2048)
+    parser.add_argument("--max_length", type=int, default=4096,
+                        help="Max sequence length (default: 4096 for H200 141GB VRAM)")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--shard_size", type=int, default=1000)
 

@@ -127,7 +127,8 @@ class EagleDrafterModel(nn.Module):
         lora_dropout: float = 0.05,
         device: str = "cuda",
         use_hidden_injection: bool = False,
-        injection_mode: str = "concat"
+        injection_mode: str = "concat",
+        quantization: str = None
     ):
         super().__init__()
 
@@ -144,17 +145,47 @@ class EagleDrafterModel(nn.Module):
 
         print(f"Loading base drafter model: {base_model_name}")
         print(f"Cache directory: {cache_dir}")
+        if quantization:
+            print(f"Quantization: {quantization}")
+
         self.config = AutoConfig.from_pretrained(base_model_name, cache_dir=cache_dir)
+
+        # Setup quantization config if requested
+        model_kwargs = {
+            "torch_dtype": torch.bfloat16,
+            "device_map": {"": device} if torch.cuda.is_available() else "cpu",
+            "cache_dir": cache_dir
+        }
+
+        if quantization == "8bit":
+            from transformers import BitsAndBytesConfig
+            model_kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_8bit=True,
+                bnb_8bit_compute_dtype=torch.bfloat16
+            )
+            model_kwargs["torch_dtype"] = torch.float16  # 8-bit requires float16
+        elif quantization == "4bit":
+            from transformers import BitsAndBytesConfig
+            model_kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4"
+            )
+
         self.base_model = AutoModelForCausalLM.from_pretrained(
             base_model_name,
-            torch_dtype=torch.bfloat16,
-            device_map={"": device} if torch.cuda.is_available() else "cpu",
-            cache_dir=cache_dir
+            **model_kwargs
         )
 
         self.hidden_dim = self.config.hidden_size
         print(f"Base model hidden dim: {self.hidden_dim}")
         print(f"Target model hidden dim: {target_hidden_dim}")
+
+        # Detect the actual dtype used by the base model for consistent layer initialization
+        # 8-bit quant uses float16, 4-bit/non-quant uses bfloat16
+        base_dtype = next(self.base_model.parameters()).dtype
+        print(f"Base model dtype: {base_dtype}")
 
         if use_lora:
             print(f"Applying LoRA (rank={lora_rank}, alpha={lora_alpha})")
@@ -174,8 +205,8 @@ class EagleDrafterModel(nn.Module):
             self.base_model = get_peft_model(self.base_model, lora_config)
             self.base_model.print_trainable_parameters()
 
-        # Initialize projection and heads with same dtype as base model (bfloat16)
-        self.dim_projection = nn.Linear(self.hidden_dim, target_hidden_dim, dtype=torch.bfloat16).to(device)
+        # Initialize projection and heads with same dtype as base model
+        self.dim_projection = nn.Linear(self.hidden_dim, target_hidden_dim, dtype=base_dtype).to(device)
 
         # Hidden state injection for distillation
         if use_hidden_injection:
@@ -184,21 +215,21 @@ class EagleDrafterModel(nn.Module):
                 self.hidden_injection = nn.Linear(
                     self.hidden_dim + target_hidden_dim,
                     self.hidden_dim,
-                    dtype=torch.bfloat16
+                    dtype=base_dtype
                 ).to(device)
             elif injection_mode == "add":
                 # Project target_hidden to drafter's hidden_dim for addition
                 self.hidden_injection = nn.Linear(
                     target_hidden_dim,
                     self.hidden_dim,
-                    dtype=torch.bfloat16
+                    dtype=base_dtype
                 ).to(device)
             else:
                 raise ValueError(f"Unknown injection_mode: {injection_mode}")
             print(f"Hidden state injection enabled: {injection_mode} mode")
 
         self.mtp_heads = nn.ModuleList([
-            EagleMTPHead(target_hidden_dim, target_hidden_dim, num_layers=2, dtype=torch.bfloat16).to(device)
+            EagleMTPHead(target_hidden_dim, target_hidden_dim, num_layers=2, dtype=base_dtype).to(device)
             for _ in range(speculation_depth)
         ])
 
