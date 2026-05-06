@@ -371,15 +371,32 @@ class EagleDrafterModel(nn.Module):
         use_hidden_injection = config.get("use_hidden_injection", False)
         injection_mode = config.get("injection_mode", "concat")
 
+        # Check if LoRA weights exist
+        lora_weights_path = Path(checkpoint_dir) / "lora_weights"
+        has_lora = lora_weights_path.exists()
+
+        # Initialize WITHOUT LoRA first (load base model)
         model = cls(
             base_model_name=config["base_model"],
             target_hidden_dim=config["target_hidden_dim"],
             speculation_depth=config["speculation_depth"],
-            use_lora=False,
+            use_lora=False,  # Start with base model
             device=device,
             use_hidden_injection=use_hidden_injection,
             injection_mode=injection_mode
         )
+
+        # Load LoRA weights if they exist
+        if has_lora:
+            print(f"Loading LoRA weights from {lora_weights_path}")
+            from peft import PeftModel
+            # Wrap base model with LoRA weights
+            model.base_model = PeftModel.from_pretrained(
+                model.base_model,
+                str(lora_weights_path),
+                is_trainable=False
+            )
+            print("LoRA weights loaded successfully")
 
         checkpoint = torch.load(
             Path(checkpoint_dir) / "eagle_heads.pt",

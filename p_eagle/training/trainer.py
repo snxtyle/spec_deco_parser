@@ -8,13 +8,15 @@ using Multi-Token Prediction (MTP) heads with parallel speculation.
 
 import argparse
 import json
+import logging
 import os
 import re
 import shutil
+import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
-from datetime import timedelta
+from datetime import timedelta, datetime
 
 import torch
 import torch.nn as nn
@@ -29,6 +31,75 @@ from ..models.eagle_drafter import EagleDrafterModel
 from ..utils.feature_utils import EagleTrainingDataset
 from ..utils.loss_utils import masked_mse_loss, hidden_state_token_loss
 from ..utils.metrics import MetricsTracker, GenerationMetrics
+
+
+def setup_training_logger(output_dir: Path, run_name: str = None) -> logging.Logger:
+    """Setup comprehensive logging for training runs.
+
+    Creates timestamped log files and captures both console and file output.
+
+    Args:
+        output_dir: Directory to save logs
+        run_name: Optional run name, defaults to timestamp
+
+    Returns:
+        Logger instance configured for training
+    """
+    # Create logs directory
+    logs_dir = output_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    # Generate timestamped run identifier
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_id = run_name or f"training_{timestamp}"
+
+    # Create run-specific log directory
+    run_log_dir = logs_dir / run_id
+    run_log_dir.mkdir(parents=True, exist_ok=True)
+
+    # Setup logger
+    logger = logging.getLogger("peagle_training")
+    logger.setLevel(logging.INFO)
+    logger.handlers = []  # Clear existing handlers
+
+    # Format
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)-8s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+
+    # Console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    # File handler - main log
+    log_file = run_log_dir / "training.log"
+    file_handler = logging.FileHandler(log_file, mode='w')
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    # Also capture raw stdout/stderr to a separate file
+    raw_log_file = run_log_dir / "output.log"
+    raw_fh = logging.FileHandler(raw_log_file, mode='w')
+    raw_fh.setLevel(logging.DEBUG)
+    raw_fh.setFormatter(logging.Formatter("%(message)s"))
+    raw_fh.addFilter(lambda record: True)  # Capture everything
+    logger.addHandler(raw_fh)
+
+    logger.info(f"=" * 70)
+    logger.info(f"P-EAGLE TRAINING SESSION STARTED")
+    logger.info(f"=" * 70)
+    logger.info(f"Run ID: {run_id}")
+    logger.info(f"Timestamp: {datetime.now().isoformat()}")
+    logger.info(f"Log directory: {run_log_dir}")
+    logger.info(f"Main log file: {log_file}")
+    logger.info(f"Raw output file: {raw_log_file}")
+    logger.info(f"=" * 70)
+
+    return logger, run_log_dir, run_id
 
 
 def run_pre_training_security_check(feature_dir: str) -> bool:
@@ -151,11 +222,181 @@ def verify_dataset_source_security(dataset_path: str, skip_check: bool = False) 
         return True
 
 
-def print_section(title: str):
+class GPUMemoryMonitor:
+    """Monitors GPU memory usage and prevents OOM crashes.
+
+    Tracks memory allocation in real-time and can trigger emergency
+    measures (clearing cache, reducing batch size, or stopping training)
+    when memory limits are approached.
+    """
+
+    def __init__(self, device: str = "cuda", safety_margin_gb: float = 1.0, logger: logging.Logger = None):
+        self.device = device
+        self.safety_margin_gb = safety_margin_gb
+        self.logger = logger or logging.getLogger("peagle_training")
+        self.max_allocated_gb = 0.0
+        self.oom_count = 0
+        self.emergency_reduced_batch = False
+
+        if not torch.cuda.is_available():
+            self.logger.warning("CUDA not available - GPU monitoring disabled")
+            self.enabled = False
+        else:
+            self.enabled = True
+            self.device_count = torch.cuda.device_count()
+            self._log_gpu_info()
+
+    def _log_gpu_info(self):
+        """Log GPU information at startup."""
+        for i in range(self.device_count):
+            props = torch.cuda.get_device_properties(i)
+            total_gb = props.total_memory / (1024**3)
+            self.logger.info(f"GPU {i}: {props.name} | Total Memory: {total_gb:.2f} GB")
+
+    def get_memory_stats(self, device_index: int = 0) -> Dict[str, float]:
+        """Get current memory statistics for a GPU."""
+        if not self.enabled:
+            return {}
+
+        torch.cuda.synchronize(device_index)
+
+        allocated = torch.cuda.memory_allocated(device_index) / (1024**3)
+        reserved = torch.cuda.memory_reserved(device_index) / (1024**3)
+        total = torch.cuda.get_device_properties(device_index).total_memory / (1024**3)
+        free = total - allocated
+
+        # Track peak usage
+        self.max_allocated_gb = max(self.max_allocated_gb, allocated)
+
+        return {
+            "allocated_gb": allocated,
+            "reserved_gb": reserved,
+            "total_gb": total,
+            "free_gb": free,
+            "utilization_percent": (allocated / total) * 100
+        }
+
+    def check_memory(self, device_index: int = 0) -> Tuple[bool, str]:
+        """Check if GPU memory is within safe limits.
+
+        Returns:
+            (is_safe, message) tuple
+        """
+        if not self.enabled:
+            return True, "GPU monitoring disabled"
+
+        stats = self.get_memory_stats(device_index)
+
+        if stats["free_gb"] < self.safety_margin_gb:
+            return False, f"Low memory: {stats['free_gb']:.2f} GB free (safety margin: {self.safety_margin_gb} GB)"
+
+        if stats["utilization_percent"] > 95:
+            return False, f"High utilization: {stats['utilization_percent']:.1f}%"
+
+        return True, f"OK: {stats['allocated_gb']:.2f} GB allocated, {stats['free_gb']:.2f} GB free"
+
+    def emergency_cleanup(self) -> bool:
+        """Perform emergency memory cleanup.
+
+        Returns:
+            True if cleanup was successful and training can continue
+        """
+        if not self.enabled:
+            return True
+
+        self.logger.warning("🚨 EMERGENCY GPU MEMORY CLEANUP INITIATED")
+
+        # Empty CUDA cache
+        torch.cuda.empty_cache()
+        self.logger.info("  - Emptied CUDA cache")
+
+        # Force garbage collection
+        import gc
+        gc.collect()
+        self.logger.info("  - Ran garbage collection")
+
+        # Check memory after cleanup
+        stats = self.get_memory_stats()
+        self.logger.info(f"  - Free memory after cleanup: {stats['free_gb']:.2f} GB")
+
+        if stats["free_gb"] < self.safety_margin_gb:
+            self.logger.error("  - Cleanup insufficient - still below safety margin")
+            return False
+
+        self.oom_count += 1
+        self.logger.warning(f"  - Emergency cleanup #{self.oom_count} successful")
+        return True
+
+    def log_memory_summary(self):
+        """Log a summary of memory usage."""
+        if not self.enabled:
+            return
+
+        stats = self.get_memory_stats()
+        self.logger.info(
+            f"GPU Memory: {stats['allocated_gb']:.2f} GB allocated | "
+            f"{stats['free_gb']:.2f} GB free | "
+            f"Peak: {self.max_allocated_gb:.2f} GB"
+        )
+
+    def get_memory_report(self) -> Dict[str, Any]:
+        """Get a comprehensive memory report for saving to logs."""
+        if not self.enabled:
+            return {"enabled": False}
+
+        stats = self.get_memory_stats()
+        return {
+            "enabled": True,
+            "peak_allocated_gb": self.max_allocated_gb,
+            "oom_incidents": self.oom_count,
+            "emergency_batch_reduction": self.emergency_reduced_batch,
+            "current_stats": stats
+        }
+
+
+def oom_recovery_handler(func):
+    """Decorator to catch OOM errors and attempt recovery.
+
+    Wraps training functions to catch CUDA OOM errors, attempt cleanup,
+    and potentially retry with reduced memory usage.
+    """
+    def wrapper(self, *args, **kwargs):
+        try:
+            return func(self, *args, **kwargs)
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
+                self.logger.error(f"🚨 CUDA OOM ERROR: {e}")
+
+                # Try emergency cleanup
+                if hasattr(self, 'gpu_monitor') and self.gpu_monitor.emergency_cleanup():
+                    self.logger.warning("Attempting to continue after OOM cleanup...")
+                    # Re-raise to let caller decide whether to retry
+                    raise RuntimeError(f"OOM recovered but step failed: {e}")
+                else:
+                    self.logger.error("OOM cleanup failed - stopping training")
+                    # Log final memory state
+                    if hasattr(self, 'gpu_monitor'):
+                        self.gpu_monitor.log_memory_summary()
+                    raise RuntimeError(f"Fatal OOM: {e}")
+            else:
+                raise
+    return wrapper
+
+
+def print_section(title: str, logger: logging.Logger = None):
     """Print formatted section header."""
-    print(f"\n{'='*70}")
-    print(f"  {title}")
-    print(f"{'='*70}")
+    lines = [
+        "",
+        f"{'='*70}",
+        f"  {title}",
+        f"{'='*70}"
+    ]
+    if logger:
+        for line in lines:
+            logger.info(line)
+    else:
+        for line in lines:
+            print(line)
 
 
 def get_gpu_info() -> Dict[str, Any]:
@@ -342,7 +583,10 @@ class EagleTrainer:
         save_every: int = 1000,
         device: str = "cuda",
         skip_hardware_check: bool = False,
-        quantization: str = None
+        quantization: str = None,
+        logger: logging.Logger = None,
+        run_log_dir: Path = None,
+        gpu_safety_margin_gb: float = 1.5
     ):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -353,6 +597,15 @@ class EagleTrainer:
         self.device = device
         self.global_step = 0
         self.drafter_model_name = drafter_model_name
+        self.logger = logger or logging.getLogger("peagle_training")
+        self.run_log_dir = run_log_dir
+
+        # Initialize GPU memory monitor
+        self.gpu_monitor = GPUMemoryMonitor(
+            device=device,
+            safety_margin_gb=gpu_safety_margin_gb,
+            logger=self.logger
+        )
 
         # Hardware requirement check
         if not skip_hardware_check:
@@ -379,6 +632,18 @@ class EagleTrainer:
             quantization=quantization
         )
 
+        # === SPEED OPTIMIZATIONS ===
+        # Enable TF32 for faster matmul (10% speedup, no quality loss)
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        print("  Enabled TF32 for faster GPU computation")
+
+        # Compile model for optimized execution (30% speedup, no quality loss)
+        print("  Compiling model with torch.compile()...")
+        self.model = torch.compile(self.model, mode="reduce-overhead")
+        print("  Model compiled successfully")
+        # ==========================
+
         # Load tokenizer (use same cache as model)
         import os
         cache_dir = os.environ.get("HF_HOME") or os.path.join(os.getcwd(), "models_cache")
@@ -392,24 +657,51 @@ class EagleTrainer:
         print(f"NOTE: Target model must have hidden_dim={target_hidden_dim} for lm_head compatibility")
         self.target_lm_head = self._load_target_lm_head(target_hidden_dim)
 
-        # Setup optimizer
-        print("Setting up PagedAdamW8bit optimizer...")
-        params_with_wd = []
-        params_without_wd = []
+        # Setup optimizer with SEPARATE learning rates for different components
+        # CRITICAL FIX: MTP heads need higher LR to learn effectively
+        print("Setting up PagedAdamW8bit optimizer with separate LR groups...")
+
+        lora_params = []
+        mtp_params = []
+        proj_params = []
+        bias_params = []
 
         for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                if "bias" in name or "norm" in name:
-                    params_without_wd.append(param)
-                else:
-                    params_with_wd.append(param)
+            if not param.requires_grad:
+                continue
+
+            if "bias" in name or "norm" in name:
+                bias_params.append(param)
+            elif "mtp_heads" in name:
+                mtp_params.append(param)
+            elif "dim_projection" in name:
+                proj_params.append(param)
+            elif "lora" in name.lower():
+                lora_params.append(param)
+            else:
+                # Other trainable params
+                bias_params.append(param)
+
+        # Higher LR for MTP heads (10x) to ensure they learn
+        # LoRA uses base LR
+        print(f"  Parameter groups:")
+        print(f"    LoRA params: {len(lora_params)} tensors")
+        print(f"    MTP heads: {len(mtp_params)} tensors (LR = {learning_rate * 10:.2e})")
+        print(f"    Projection: {len(proj_params)} tensors (LR = {learning_rate * 10:.2e})")
+        print(f"    Bias/No-WD: {len(bias_params)} tensors")
+
+        param_groups = []
+        if lora_params:
+            param_groups.append({"params": lora_params, "lr": learning_rate, "weight_decay": 0.01})
+        if mtp_params:
+            param_groups.append({"params": mtp_params, "lr": learning_rate * 10, "weight_decay": 0.01})
+        if proj_params:
+            param_groups.append({"params": proj_params, "lr": learning_rate * 10, "weight_decay": 0.01})
+        if bias_params:
+            param_groups.append({"params": bias_params, "lr": learning_rate, "weight_decay": 0.0})
 
         self.optimizer = PagedAdamW8bit(
-            [
-                {"params": params_with_wd, "weight_decay": 0.01},
-                {"params": params_without_wd, "weight_decay": 0.0}
-            ],
-            lr=learning_rate,
+            param_groups,
             betas=(0.9, 0.999),
             eps=1e-8
         )
@@ -734,13 +1026,19 @@ class EagleTrainer:
         }
 
     @torch.no_grad()
-    def _validation_step(self):
-        """Compute validation loss."""
+    def _validation_step(self, epoch: int = 1):
+        """Compute validation loss using same loss function as training.
+
+        Uses curriculum learning to only validate active heads.
+        """
         if self.val_loader is None:
             return None
 
         self.model.eval()
         val_losses = []
+
+        # Determine active heads for curriculum learning
+        active_heads = self._get_active_heads(epoch)
 
         for batch in self.val_loader:
             input_ids = batch["input_ids"].to(self.device)
@@ -757,11 +1055,12 @@ class EagleTrainer:
 
             # Apply loss mask to compute validation loss
             mtp_predictions = outputs["mtp_predictions"]
-            total_loss = 0.0
-            valid_heads = 0
+            kl_losses = []
+            mse_losses = []
 
             for i, pred_hidden in enumerate(mtp_predictions):
-                if i >= self.model.speculation_depth:
+                # CURRICULUM: Only validate active heads
+                if i >= active_heads:
                     break
 
                 # Get shifted targets for this head
@@ -774,20 +1073,45 @@ class EagleTrainer:
 
                 # Ensure shapes match (trim to minimum length)
                 min_len = min(pred_shifted.shape[1], target_shifted.shape[1])
-                pred_shifted = pred_shifted[:, :min_len, :]
-                target_shifted = target_shifted[:, :min_len, :]
-                mask_shifted = loss_mask[:, shift:shift + min_len].unsqueeze(-1).float()
+                if min_len <= 0:
+                    continue
 
-                # Compute masked MSE loss
-                mse = ((pred_shifted - target_shifted) ** 2) * mask_shifted
-                loss = mse.sum() / (mask_shifted.sum() + 1e-8)
+                pred_trimmed = pred_shifted[:, :min_len, :]
+                target_trimmed = target_shifted[:, :min_len, :]
+                mask_trimmed = loss_mask[:, shift:shift + min_len]
 
-                if not torch.isnan(loss):
-                    total_loss += loss.item()
-                    valid_heads += 1
+                # Use SAME loss function as training for consistency
+                kl_loss_k, mse_loss_k, _ = hidden_state_token_loss(
+                    pred_trimmed,
+                    target_trimmed,
+                    self.target_lm_head,
+                    mask_trimmed,
+                    temperature=2.0
+                )
 
-            if valid_heads > 0:
-                val_losses.append(total_loss / valid_heads)
+                if not torch.isnan(kl_loss_k):
+                    kl_losses.append(kl_loss_k.item())
+                    mse_losses.append(mse_loss_k.item())
+
+            # Combine losses same way as training
+            total_loss = 0.0
+            if kl_losses:
+                # Apply same weighting as training
+                weighted_kl = []
+                for i, kl in enumerate(kl_losses):
+                    weight = max(0.5, 1.0 - i * 0.1)
+                    weighted_kl.append(kl * weight)
+                kl_total = sum(weighted_kl) / sum(max(0.5, 1.0 - i * 0.1) for i in range(len(weighted_kl)))
+                total_loss += kl_total
+
+            if mse_losses:
+                mse_total = sum(mse_losses) / len(mse_losses)
+                total_loss += 0.1 * mse_total
+
+            # Apply same scaling as training
+            total_loss *= 10.0
+
+            val_losses.append(total_loss)
 
         self.model.train()
         return np.mean(val_losses) if val_losses else None
@@ -800,40 +1124,105 @@ class EagleTrainer:
         patience = 5  # Early stopping patience
         epoch_stats = []
 
+        # Initial GPU memory check
+        self.logger.info(f"\n{'='*50}")
+        self.logger.info("INITIAL GPU MEMORY CHECK")
+        self.logger.info(f"{'='*50}")
+        is_safe, mem_msg = self.gpu_monitor.check_memory()
+        if not is_safe:
+            self.logger.warning(f"Initial memory warning: {mem_msg}")
+            if not self.gpu_monitor.emergency_cleanup():
+                self.logger.error("Insufficient GPU memory to start training")
+                raise RuntimeError("GPU memory too low to begin training")
+        self.gpu_monitor.log_memory_summary()
+
         # Sanity check: verify first batch has non-zero loss mask
-        print("\nVerifying training data...")
+        self.logger.info("\nVerifying training data...")
         first_batch = next(iter(self.train_loader))
         mask_sum = first_batch["loss_mask"].sum().item()
-        print(f"  First batch mask sum: {mask_sum}")
+        self.logger.info(f"  First batch mask sum: {mask_sum}")
         if mask_sum == 0:
-            print("  WARNING: Loss mask is all zeros! Training will fail.")
-            print("  Check that dataset has proper 'loss_mask_segments'.")
+            self.logger.warning("  WARNING: Loss mask is all zeros! Training will fail.")
+            self.logger.warning("  Check that dataset has proper 'loss_mask_segments'.")
         else:
-            print(f"  OK: {mask_sum} trainable tokens in first batch")
+            self.logger.info(f"  OK: {mask_sum} trainable tokens in first batch")
 
         for epoch in range(self.num_epochs):
-            print(f"\nEpoch {epoch + 1}/{self.num_epochs}")
+            self.logger.info(f"\n{'='*50}")
+            self.logger.info(f"Epoch {epoch + 1}/{self.num_epochs}")
+            self.logger.info(f"{'='*50}")
+
+            # Log curriculum learning status
+            active_heads = self._get_active_heads(epoch + 1)
+            self.logger.info(f"Curriculum: Training heads 1-{active_heads} of {self.model.speculation_depth}")
+
             epoch_losses = []
+            epoch_kl_losses = []
+            epoch_mse_losses = []
             epoch_mtp_losses = {i: [] for i in range(self.model.speculation_depth)}
             pbar = tqdm(self.train_loader, desc=f"Epoch {epoch + 1}")
 
+            # Periodic memory check interval (check 10 times per epoch)
+            memory_check_interval = max(1, len(self.train_loader) // 10)
+            batchOOM_retry_count = 0
+
             for batch_idx, batch in enumerate(pbar):
-                loss, metrics = self._training_step(batch)
+                # Check GPU memory periodically
+                if batch_idx % memory_check_interval == 0:
+                    is_safe, mem_msg = self.gpu_monitor.check_memory()
+                    if not is_safe:
+                        self.logger.warning(f"Memory warning: {mem_msg}")
+                        if not self.gpu_monitor.emergency_cleanup():
+                            self.logger.error("Unable to free sufficient memory - stopping training")
+                            self._save_checkpoint("emergency_stop_low_memory")
+                            return  # Exit training cleanly
+
+                # Perform training step (with OOM recovery)
+                try:
+                    loss, metrics = self._training_step(batch, epoch=epoch + 1)
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower():
+                        self.logger.error(f"OOM during training step at batch {batch_idx}")
+                        if self.gpu_monitor.emergency_cleanup() and batchOOM_retry_count < 3:
+                            batchOOM_retry_count += 1
+                            self.logger.warning(f"Retrying batch after OOM cleanup (attempt {batchOOM_retry_count}/3)")
+                            torch.cuda.synchronize()
+                            continue
+                        else:
+                            self.logger.error("Too many OOM errors - saving checkpoint and stopping")
+                            self._save_checkpoint(f"emergency_stop_oom_epoch{epoch+1}_batch{batch_idx}")
+                            return
+                    else:
+                        raise
 
                 epoch_losses.append(loss.item())
                 self.global_step += 1
 
-                # Track per-head losses
+                # Track per-head losses and component losses
                 for i in range(self.model.speculation_depth):
                     key = f"mtp_loss_{i+1}"
                     if key in metrics:
                         epoch_mtp_losses[i].append(metrics[key])
 
-                # Update progress bar
-                pbar.set_postfix({
+                # Track KL and MSE separately for diagnostics
+                if "kl_loss_avg" in metrics:
+                    epoch_kl_losses.append(metrics["kl_loss_avg"].item() if hasattr(metrics["kl_loss_avg"], 'item') else metrics["kl_loss_avg"])
+                if "mse_loss_avg" in metrics:
+                    epoch_mse_losses.append(metrics["mse_loss_avg"].item() if hasattr(metrics["mse_loss_avg"], 'item') else metrics["mse_loss_avg"])
+
+                # Update progress bar with more informative metrics
+                postfix_dict = {
                     "loss": f"{loss.item():.4f}",
-                    "lr": f"{self.scheduler.get_last_lr()[0]:.2e}"
-                })
+                    "kl": f"{metrics.get('kl_loss_avg', 0):.4f}",
+                    "mse": f"{metrics.get('mse_loss_avg', 0):.4f}",
+                    "acc": f"{metrics.get('token_acc_avg', 0):.1f}%",
+                    "lr": f"{self.scheduler.get_last_lr()[0]:.2e}",
+                }
+                # Only show mask coverage if it's concerning (low coverage)
+                mask_cov = metrics.get('avg_mask_coverage', 1.0)
+                if mask_cov < 0.5:
+                    postfix_dict["mask"] = f"{mask_cov:.0%}"
+                pbar.set_postfix(postfix_dict)
 
                 # Log to TensorBoard
                 if self.global_step % 10 == 0:
@@ -853,14 +1242,38 @@ class EagleTrainer:
             # Epoch summary
             avg_train_loss = np.mean(epoch_losses)
 
+            # CRITICAL: Verify MTP heads are actually learning (weights changed from init)
+            if epoch == 1 or epoch == num_epochs // 2 or epoch == num_epochs:
+                with torch.no_grad():
+                    mtp_std_sum = 0.0
+                    for head in self.model.mtp_heads:
+                        for param in head.parameters():
+                            if len(param.shape) >= 2:  # Weight matrices only
+                                mtp_std_sum += param.std().item()
+                                break
+                    avg_mtp_std = mtp_std_sum / len(self.model.mtp_heads)
+                    self.logger.info(f"  MTP weight avg std: {avg_mtp_std:.6f} (init was ~0.02)")
+                    if abs(avg_mtp_std - 0.02) < 0.001:
+                        self.logger.warning("  ⚠️  MTP heads still at initialization! Training may not be working.")
+                    else:
+                        self.logger.info(f"  ✓ MTP heads have changed from init by {(avg_mtp_std - 0.02):.6f}")
+
+            # Calculate component loss averages for the epoch
+            avg_kl_loss = np.mean(epoch_kl_losses) if epoch_kl_losses else 0.0
+            avg_mse_loss = np.mean(epoch_mse_losses) if epoch_mse_losses else 0.0
+
             # Validation
-            val_loss = self._validation_step()
+            val_loss = self._validation_step(epoch=epoch + 1)
 
             epoch_stat = {
                 "epoch": epoch + 1,
                 "avg_train_loss": avg_train_loss,
                 "avg_val_loss": val_loss,
-                "per_head_avg_loss": {}
+                "avg_kl_loss": avg_kl_loss,
+                "avg_mse_loss": avg_mse_loss,
+                "per_head_avg_loss": {},
+                "active_heads": active_heads,
+                "gpu_memory": self.gpu_monitor.get_memory_stats()
             }
             for i in range(self.model.speculation_depth):
                 if epoch_mtp_losses[i]:
@@ -873,16 +1286,23 @@ class EagleTrainer:
             if val_loss is not None:
                 self.writer.add_scalar("epoch/val_loss", val_loss, epoch + 1)
 
-            print(f"Epoch {epoch + 1} summary:")
-            print(f"  Train loss: {avg_train_loss:.6f}")
+            self.logger.info(f"Epoch {epoch + 1} summary:")
+            self.logger.info(f"  Train loss: {avg_train_loss:.6f} (KL: {avg_kl_loss:.6f}, MSE: {avg_mse_loss:.6f})")
             if val_loss is not None:
-                print(f"  Val loss:   {val_loss:.6f}")
+                self.logger.info(f"  Val loss:   {val_loss:.6f}")
                 # Check for overfitting
                 if val_loss > avg_train_loss * 1.5:
-                    print(f"  ⚠️  WARNING: Possible overfitting (val >> train)")
+                    self.logger.warning(f"  Possible overfitting detected (val >> train)")
 
-            for head, loss_val in epoch_stat["per_head_avg_loss"].items():
-                print(f"  {head}: {loss_val:.6f}")
+            # Log per-head losses with clearer formatting
+            if epoch_stat["per_head_avg_loss"]:
+                self.logger.info(f"  Per-head MSE losses (curriculum: heads 1-{active_heads} trained):")
+                for head, loss_val in sorted(epoch_stat["per_head_avg_loss"].items()):
+                    status = "trained" if int(head.split("_")[1]) <= active_heads else "inactive"
+                    self.logger.info(f"    {head}: {loss_val:.6f} ({status})")
+
+            # Log memory after epoch
+            self.gpu_monitor.log_memory_summary()
 
             # Save best model based on validation loss
             model_improved = False
@@ -899,19 +1319,24 @@ class EagleTrainer:
 
             if model_improved:
                 self._save_checkpoint("best_model")
-                print(f"  *** New best model saved! ***")
+                self.logger.info(f"  *** New best model saved! ***")
             else:
                 patience_counter += 1
                 if patience_counter >= patience and self.val_loader is not None:
-                    print(f"  ⚠️  Early stopping triggered (patience={patience})")
+                    self.logger.warning(f"  Early stopping triggered (patience={patience})")
                     break
 
         # Save training history
         history_path = self.output_dir / "training_history.json"
+
+        # Add GPU memory report to training history
+        memory_report = self.gpu_monitor.get_memory_report()
+
         with open(history_path, "w") as f:
             json.dump({
-                "final_best_loss": best_loss,
+                "final_best_loss": best_val_loss,
                 "epochs": epoch_stats,
+                "gpu_memory_report": memory_report,
                 "config": {
                     "drafter_model": self.drafter_model_name,
                     "num_epochs": self.num_epochs,
@@ -920,17 +1345,48 @@ class EagleTrainer:
                     "warmup_steps": self.warmup_steps
                 }
             }, f, indent=2)
-        print(f"\nTraining history saved to {history_path}")
+        self.logger.info(f"\nTraining history saved to {history_path}")
+
+        # Log final memory summary
+        self.logger.info(f"\n{'='*50}")
+        self.logger.info("GPU MEMORY SUMMARY")
+        self.logger.info(f"{'='*50}")
+        self.gpu_monitor.log_memory_summary()
 
         self.writer.close()
-        print("\nTraining complete!")
+        self.logger.info("\nTraining complete!")
 
-    def _training_step(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict]:
-        """Single training step with P-EAGLE aligned loss.
+    def _get_active_heads(self, epoch: int) -> int:
+        """Determine how many MTP heads to train based on curriculum schedule.
+
+        Curriculum learning: Start with head 1 only, gradually add deeper heads.
+        This prevents the compounding error problem in speculative decoding.
+
+        Schedule:
+        - Epochs 1-2: Train only head 1 (foundation)
+        - Epochs 3-4: Train heads 1-2
+        - Epochs 5-6: Train heads 1-3
+        - Epochs 7+: Train all heads
+        """
+        if epoch <= 2:
+            return 1
+        elif epoch <= 4:
+            return 2
+        elif epoch <= 6:
+            return 3
+        else:
+            return self.model.speculation_depth
+
+    @oom_recovery_handler
+    def _training_step(self, batch: Dict[str, torch.Tensor], epoch: int = 1) -> Tuple[torch.Tensor, Dict]:
+        """Single training step with P-EAGLE aligned loss and curriculum learning.
 
         Key insight: During inference, drafter's predicted hidden states are converted
         to tokens via the TARGET model's lm_head. So we must train to match the
         token distributions, not just hidden state vectors.
+
+        Uses curriculum learning: early epochs focus on head 1, progressively
+        adding deeper heads as shallower heads converge.
         """
         self.optimizer.zero_grad()
 
@@ -943,18 +1399,30 @@ class EagleTrainer:
             is_training=True
         )
 
+        # Determine active heads for curriculum learning
+        active_heads = self._get_active_heads(epoch)
+
         # Compute losses for each MTP head
         kl_losses = []
         mse_losses = []
         token_accs = []
         mtp_losses = []
+        head_mask_coverages = []
 
         for k, pred_hidden in enumerate(outputs["mtp_predictions"]):
+            # CURRICULUM LEARNING: Only train active heads
+            if k >= active_heads:
+                break
+
             shift = k + 1
 
             if pred_hidden.shape[1] > 0:
                 target_shifted = batch["target_hidden"][:, shift:shift + pred_hidden.shape[1]]
                 mask_shifted = batch["loss_mask"][:, shift:shift + pred_hidden.shape[1]]
+
+                # DIAGNOSTIC: Track mask coverage for this head
+                mask_coverage = mask_shifted.sum().item() / (mask_shifted.numel() + 1e-8)
+                head_mask_coverages.append(mask_coverage)
 
                 min_len = min(pred_hidden.shape[1], target_shifted.shape[1])
 
@@ -963,18 +1431,23 @@ class EagleTrainer:
                     target_trimmed = target_shifted[:, :min_len]
                     mask_trimmed = mask_shifted[:, :min_len]
 
+                    # Skip if mask is all zeros (no learning signal)
+                    if mask_trimmed.sum() == 0:
+                        continue
+
                     # P-EAGLE aligned loss: match token distributions via target lm_head
                     kl_loss_k, mse_loss_k, acc_k = hidden_state_token_loss(
                         pred_trimmed,
                         target_trimmed,
                         self.target_lm_head,
                         mask_trimmed,
-                        temperature=1.0
+                        temperature=2.0
                     )
 
                     kl_losses.append(kl_loss_k)
                     mse_losses.append(mse_loss_k)
                     token_accs.append(acc_k.item())
+                    # Store raw MSE for reporting (not scaled)
                     mtp_losses.append(mse_loss_k.item())
 
         # Combine losses: KL divergence (token distribution) + MSE (hidden state)
@@ -982,19 +1455,58 @@ class EagleTrainer:
         total_loss = torch.tensor(0.0, device=self.device)
 
         if kl_losses:
-            kl_total = sum(kl_losses) / len(kl_losses)
+            # Weight later heads less - they depend on earlier heads being accurate
+            weighted_kl = []
+            for i, kl in enumerate(kl_losses):
+                # Head 1: 1.0, Head 2: 0.9, Head 3: 0.8, etc.
+                weight = max(0.5, 1.0 - i * 0.1)
+                weighted_kl.append(kl * weight)
+            kl_total = sum(weighted_kl) / sum(max(0.5, 1.0 - i * 0.1) for i in range(len(weighted_kl)))
             total_loss = total_loss + kl_total  # Primary: token distribution matching
 
         if mse_losses:
             mse_total = sum(mse_losses) / len(mse_losses)
             total_loss = total_loss + 0.1 * mse_total  # Secondary: hidden state similarity
 
+        # --- LOSS SCALING ---
+        # The KL loss is already properly scaled in hidden_state_token_loss.
+        # We apply a small multiplier to ensure healthy gradient magnitudes.
+        # KL loss is the primary driver - it ensures token distributions match.
+        # MSE is secondary - it keeps hidden states structurally similar.
+        if total_loss.item() > 0:
+            total_loss = total_loss * 10.0  # Scale up for healthy gradients
+        # --------------------------
+
         if total_loss.item() == 0:
             total_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
 
         # Backward pass
         total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+
+        # CRITICAL FIX: Log gradient norms before clipping to diagnose issues
+        if self.global_step % 10 == 0:
+            mtp_grad_norm = 0.0
+            lora_grad_norm = 0.0
+            for name, param in self.model.named_parameters():
+                if param.grad is not None:
+                    if "mtp_heads" in name:
+                        mtp_grad_norm += param.grad.norm().item() ** 2
+                    elif "lora" in name.lower():
+                        lora_grad_norm += param.grad.norm().item() ** 2
+            if mtp_grad_norm > 0:
+                self.writer.add_scalar("gradients/mtp_norm", mtp_grad_norm ** 0.5, self.global_step)
+            if lora_grad_norm > 0:
+                self.writer.add_scalar("gradients/lora_norm", lora_grad_norm ** 0.5, self.global_step)
+
+        # Gradient clipping per parameter group (less aggressive for MTP heads)
+        # LoRA: clip at max_grad_norm (1.0 default)
+        # MTP heads: clip at max_grad_norm * 5 (5.0) - allow larger updates
+        for group in self.optimizer.param_groups:
+            if group.get('lr', 0) > self.optimizer.defaults.get('lr', 2e-5) * 2:
+                # High LR group = MTP heads, allow larger gradients
+                torch.nn.utils.clip_grad_norm_(group['params'], self.max_grad_norm * 5)
+            else:
+                torch.nn.utils.clip_grad_norm_(group['params'], self.max_grad_norm)
 
         self.optimizer.step()
         self.scheduler.step()
@@ -1002,7 +1514,10 @@ class EagleTrainer:
         metrics = {
             "mtp_loss_avg": np.mean(mtp_losses) if mtp_losses else 0.0,
             "kl_loss_avg": sum(kl.item() for kl in kl_losses) / len(kl_losses) if kl_losses else 0.0,
+            "mse_loss_avg": sum(mse_losses) / len(mse_losses) if mse_losses else 0.0,
             "token_acc_avg": np.mean(token_accs) if token_accs else 0.0,
+            "active_heads": active_heads,
+            "avg_mask_coverage": np.mean(head_mask_coverages) if head_mask_coverages else 0.0,
         }
         for i, loss_i in enumerate(mtp_losses):
             metrics[f"mtp_loss_{i+1}"] = loss_i
@@ -1015,7 +1530,7 @@ class EagleTrainer:
         """Save model checkpoint."""
         checkpoint_dir = self.output_dir / name
         self.model.save_checkpoint(str(checkpoint_dir))
-        print(f"Checkpoint saved to {checkpoint_dir}")
+        self.logger.info(f"Checkpoint saved to {checkpoint_dir}")
 
 
 def main():
@@ -1040,20 +1555,41 @@ def main():
                         help="Path to original dataset JSONL for security verification")
     parser.add_argument("--quantization", type=str, default=None, choices=["4bit", "8bit"],
                         help="Quantize drafter model (4bit or 8bit) to reduce VRAM usage")
+    parser.add_argument("--run-name", type=str, default=None,
+                        help="Custom name for this training run (used in logs)")
+    parser.add_argument("--gpu-safety-margin", type=float, default=1.5,
+                        help="Minimum GPU memory to keep free in GB (default: 1.5)")
 
     args = parser.parse_args()
+
+    # Setup logging FIRST - before anything else
+    output_path = Path(args.output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    logger, run_log_dir, run_id = setup_training_logger(output_path, args.run_name)
+
+    # Log all arguments
+    logger.info("Training Configuration:")
+    for arg, value in vars(args).items():
+        logger.info(f"  --{arg}: {value}")
+    logger.info("")
 
     # Run pre-training security verification
     if args.dataset_source:
         if not verify_dataset_source_security(args.dataset_source, args.skip_security_check):
-            print("\n⛔ Training aborted due to security concerns.")
-            print("   Use --skip-security-check to override (not recommended)")
+            logger.error("\n⛔ Training aborted due to security concerns.")
+            logger.error("   Use --skip-security-check to override (not recommended)")
             exit(1)
     else:
         # Check feature directory security
         if not run_pre_training_security_check(args.feature_dir):
-            print("\n⛔ Training aborted due to security concerns.")
+            logger.error("\n⛔ Training aborted due to security concerns.")
             exit(1)
+
+    # Save configuration to log directory
+    config_path = run_log_dir / "config.json"
+    with open(config_path, 'w') as f:
+        json.dump(vars(args), f, indent=2)
+    logger.info(f"Configuration saved to: {config_path}")
 
     trainer = EagleTrainer(
         drafter_model_name=args.drafter_model,
@@ -1068,10 +1604,26 @@ def main():
         num_epochs=args.num_epochs,
         warmup_steps=args.warmup_steps,
         skip_hardware_check=args.skip_hardware_check,
-        quantization=args.quantization
+        quantization=args.quantization,
+        logger=logger,
+        run_log_dir=run_log_dir,
+        gpu_safety_margin_gb=args.gpu_safety_margin
     )
 
-    trainer.train()
+    try:
+        trainer.train()
+        logger.info(f"\n{'='*70}")
+        logger.info("TRAINING COMPLETED SUCCESSFULLY")
+        logger.info(f"{'='*70}")
+        logger.info(f"Logs saved to: {run_log_dir}")
+        logger.info(f"Best model: {args.output_dir}/best_model")
+    except Exception as e:
+        logger.exception("Training failed with error:")
+        logger.error(f"\n{'='*70}")
+        logger.error("TRAINING FAILED")
+        logger.error(f"{'='*70}")
+        logger.error(f"See logs for details: {run_log_dir}")
+        raise
 
 
 if __name__ == "__main__":

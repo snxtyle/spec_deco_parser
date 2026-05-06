@@ -77,7 +77,8 @@ def hidden_state_token_loss(
     target_hidden: torch.Tensor,
     target_lm_head: nn.Module,
     mask: torch.Tensor,
-    temperature: float = 1.0
+    temperature: float = 2.0,
+    kl_weight: float = 1.0
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Loss that aligns predicted hidden states with target's token distribution.
@@ -92,21 +93,21 @@ def hidden_state_token_loss(
         target_hidden: [batch, seq_len, hidden_dim] - target model hidden states
         target_lm_head: Target model's lm_head (converts hidden -> logits)
         mask: [batch, seq_len] - 1 for valid positions
-        temperature: Softmax temperature
+        temperature: Softmax temperature (default 2.0 for softer distributions)
+        kl_weight: Weight for KL loss component (default 1.0)
 
     Returns:
-        token_loss: Cross-entropy between predicted and target token distributions
+        token_loss: KL divergence between predicted and target token distributions
         mse_loss: Mean squared error between hidden states
         accuracy: Token prediction accuracy (%)
     """
-    print(f"DEBUG: hidden_state_token_loss called, mask_sum={mask.sum().item()}")
     # Get token distributions from both hidden states using TARGET's lm_head
     # This matches inference: drafter hidden -> target lm_head -> tokens
     pred_logits = target_lm_head(pred_hidden)  # [batch, seq_len, vocab_size]
     target_logits = target_lm_head(target_hidden)
 
     # Compute KL divergence between token distributions
-    # This is softer than hard accuracy - encourages similar probability distributions
+    # Higher temperature (2.0) produces softer distributions which are easier to learn
     pred_log_probs = F.log_softmax(pred_logits / temperature, dim=-1)
     target_probs = F.softmax(target_logits / temperature, dim=-1)
 
@@ -117,14 +118,10 @@ def hidden_state_token_loss(
         reduction='none'
     ).sum(dim=-1)  # [batch, seq_len]
 
-    # Apply mask and average (divide by vocab size to normalize)
-    vocab_size = pred_logits.shape[-1]
-    masked_kl = (kl_loss * mask).sum() / (mask.sum() * vocab_size + 1e-8)
-
-    # DEBUG: Print loss components
-    if mask.sum() > 0:
-        raw_kl = kl_loss.sum().item()
-        print(f"  DEBUG KL: raw={raw_kl:.2f}, masked={masked_kl.item():.6f}, vocab={vocab_size}, tokens={mask.sum().item()}")
+    # Apply mask and average
+    # Scale by temperature^2 to account for softened distributions
+    masked_kl = (kl_loss * mask).sum() / (mask.sum() + 1e-8)
+    masked_kl = masked_kl * (temperature ** 2) * kl_weight
 
     # Also compute MSE for hidden state similarity
     mse_loss = masked_mse_loss(pred_hidden, target_hidden, mask)

@@ -292,6 +292,10 @@ if [ "$SKIP_TRAINING" = false ]; then
         find "$CHECKPOINT_DIR" -mindepth 1 -maxdepth 1 ! -name "logs" -type d -exec rm -rf {} + 2>/dev/null || true
     fi
 
+    echo "Setting up training optimizations..."
+    export PYTHONDONTWRITEBYTECODE=1
+    export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+
     CMD="python3 -m p_eagle.scripts.train_drafter \
         --drafter_model $DRAFTER_MODEL \
         --target_hidden_dim $TARGET_HIDDEN_DIM \
@@ -311,7 +315,11 @@ if [ "$SKIP_TRAINING" = false ]; then
     if [ "$RUN_DRY" = true ]; then
         echo "CMD: $CMD"
     else
-        eval $CMD
+        mkdir -p /workspace/P_Eagle/logs
+        LOG_FILE="/workspace/P_Eagle/logs/training_$(date +%Y%m%d_%H%M%S).log"
+        echo "Training started. Logging to: $LOG_FILE"
+        echo "View live: tail -f $LOG_FILE"
+        eval $CMD 2>&1 | tee "$LOG_FILE"
         echo "Training complete. Best model: $CHECKPOINT_DIR/best_model"
     fi
 else
