@@ -667,6 +667,11 @@ class EagleTrainer:
         # self.model = torch.compile(self.model, mode="reduce-overhead")
         # ==========================
 
+        # Enable gradient checkpointing to save VRAM (trades compute for memory)
+        if hasattr(self.model.base_model, 'gradient_checkpointing_enable'):
+            self.model.base_model.gradient_checkpointing_enable()
+            print("  Enabled gradient checkpointing (saves ~50% VRAM)")
+
         # Load tokenizer (use same cache as model)
         import os
         cache_dir = os.environ.get("HF_HOME") or os.path.join(os.getcwd(), "models_cache")

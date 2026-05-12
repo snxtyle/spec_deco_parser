@@ -95,11 +95,21 @@ def run_inference(
     print(f"Prompt tokens: {original_length}")
     print("-" * 50)
 
+    # Import tree attention
+    from p_eagle.models.tree_attention import TreeAttentionMask, verify_drafts_parallel
+
+    # Initialize tree attention
+    tree_attn = TreeAttentionMask(speculation_depth)
+
     # Generation loop
     generated = input_ids.clone()
     total_draft_tokens = 0
     total_accepted = 0
     target_passes = 0
+
+    # KV-cache for efficient inference (if model supports it)
+    past_key_values = None
+    use_kv_cache = hasattr(target_model.config, 'use_cache')
 
     start_time = time.time()
 
@@ -107,9 +117,25 @@ def run_inference(
         if generated.shape[1] >= original_length + max_new_tokens:
             break
 
+        current_seq_len = generated.shape[1]
+
         # EAGLE: First get target model's hidden state at current position
+        # Use KV-cache if available for efficiency
         with torch.no_grad():
-            target_outputs = target_model(generated, output_hidden_states=True)
+            if use_kv_cache and past_key_values is not None:
+                # Only process the last token with KV-cache
+                target_outputs = target_model(
+                    generated[:, -1:],
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    output_hidden_states=True
+                )
+                past_key_values = target_outputs.past_key_values
+            else:
+                target_outputs = target_model(generated, output_hidden_states=True)
+                if use_kv_cache:
+                    past_key_values = target_outputs.past_key_values
+
             target_hidden = target_outputs.hidden_states[-1]  # [batch, seq_len, hidden_dim]
 
         # Generate K draft hidden states using drafter with EAGLE-3 hidden injection
@@ -132,21 +158,41 @@ def run_inference(
             # Pass through target's lm_head to get logits
             logits = target_lm_head(pred_hidden)  # [batch, 1, vocab_size]
 
-            # Greedy decode
-            token_id = torch.argmax(logits, dim=-1)  # [batch, 1]
+            # Apply temperature sampling
+            if temperature > 0 and temperature != 1.0:
+                logits = logits / temperature
+
+            if temperature == 0:
+                # Greedy decode
+                token_id = torch.argmax(logits, dim=-1)  # [batch, 1]
+            else:
+                # Sample from distribution
+                probs = F.softmax(logits, dim=-1)
+                token_id = torch.multinomial(probs[0], num_samples=1).unsqueeze(0)
+
             draft_tokens.append(token_id.item())
 
         total_draft_tokens += len(draft_tokens)
 
-        # Verify with target model
+        # Verify with target model using tree attention for parallel verification
         draft_tensor = torch.tensor([draft_tokens], device=device)
-        verification_input = torch.cat([generated, draft_tensor], dim=1)
 
+        # Use tree attention for efficient parallel verification
         with torch.no_grad():
-            verify_outputs = target_model(verification_input)
-            verify_logits = verify_outputs.logits[0, generated.shape[1]-1:, :]
+            tree_inputs = tree_attn.prepare_tree_inputs(generated, draft_tensor)
 
-        # Accept tokens greedily
+            # Single forward pass with tree attention mask
+            verify_outputs = target_model(
+                input_ids=tree_inputs["input_ids"],
+                attention_mask=tree_inputs["attention_mask"],
+                position_ids=tree_inputs["position_ids"]
+            )
+
+            # Get logits for speculative positions
+            verified_len = tree_inputs["verified_len"]
+            verify_logits = verify_outputs.logits[0, verified_len-1:verified_len-1+len(draft_tokens), :]
+
+        # Accept tokens greedily (sequential acceptance is still correct)
         accepted = []
         for i, draft_token in enumerate(draft_tokens):
             target_token = torch.argmax(verify_logits[i]).item()
@@ -154,13 +200,15 @@ def run_inference(
                 accepted.append(draft_token)
                 total_accepted += 1
             else:
-                # Accept target's choice
+                # Accept target's choice and stop
                 accepted.append(target_token)
                 break
 
         if accepted:
             new_tokens = torch.tensor([accepted], device=device)
             generated = torch.cat([generated, new_tokens], dim=1)
+            # Reset KV-cache when sequence changes
+            past_key_values = None
 
         target_passes += 1
 
