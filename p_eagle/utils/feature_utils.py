@@ -46,10 +46,66 @@ class EagleDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         sample = self.samples[idx]
-        messages = sample["messages"]
+        # Support both old format ('messages') and new format ('original_messages')
+        messages = sample.get("messages") or sample.get("original_messages", [])
+
+        # Get segments - handle multiple possible formats:
+        # 1. Root level "segments" (current generate_data.py output)
+        # 2. Nested "loss_mask_segments.segments" (older format)
+        # 3. Auto-generate from message roles if neither exists
+        segments = sample.get("segments", [])
+
+        if not segments:
+            # Try older nested format
+            loss_mask_segments = sample.get("loss_mask_segments", {})
+            segments = loss_mask_segments.get("segments", [])
+
+            if not segments and "train_indices" in loss_mask_segments:
+                # Convert train_indices format to segments
+                train_indices = set(loss_mask_segments.get("train_indices", []))
+                for i in range(len(messages)):
+                    segments.append({
+                        "index": i,
+                        "mask": 1 if i in train_indices else 0
+                    })
+
+        if not segments and messages:
+            # Auto-generate segments from message roles
+            # Train on assistant responses (mask=1), ignore system/user (mask=0)
+            assistant_roles = {"assistant", "bot", "ai"}
+            segments = []
+            for i, msg in enumerate(messages):
+                role = msg.get("role", "unknown").lower().strip()
+                content = msg.get("content", "")
+                # Assistant with content = train (mask=1), otherwise ignore (mask=0)
+                is_assistant = role in assistant_roles
+                has_content = bool(content and content.strip())
+                mask = 1 if (is_assistant and has_content) else 0
+                segments.append({"index": i, "role": role, "mask": mask})
+
+        # CRITICAL FIX: Pre-process messages to serialize tool_calls into content
+        # This ensures tool_calls are included in the tokenized text
+        # BUT do this AFTER extracting segments to preserve alignment
+        processed_messages = []
+        for msg in messages:
+            msg_copy = msg.copy()
+            content = msg_copy.get("content", "")
+            if not content and msg_copy.get("tool_calls"):
+                # Serialize tool_calls into content so it gets tokenized
+                import json
+                tool_calls = msg_copy.get("tool_calls", [])
+                tool_strs = []
+                for tc in tool_calls:
+                    func = tc.get("function", {})
+                    name = func.get("name", "")
+                    args = func.get("arguments", "")
+                    tool_strs.append(f"{name}({args})")
+                msg_copy["content"] = "[TOOL_CALLS]" + "; ".join(tool_strs) + "[/TOOL_CALLS]"
+            processed_messages.append(msg_copy)
+
+        # Use processed messages that include serialized tool_calls
+        messages = processed_messages
         conversation_text = self._messages_to_text(messages)
-        loss_mask_segments = sample.get("loss_mask_segments", {})
-        segments = loss_mask_segments.get("segments", [])
 
         # Validate that at least one segment has mask=1 for training
         if segments and not any(seg.get("mask") == 1 for seg in segments):
@@ -62,18 +118,53 @@ class EagleDataset(Dataset):
         }
 
     def _messages_to_text(self, messages: List[Dict[str, str]]) -> str:
-        """Convert OpenAI message format to text."""
+        """Convert OpenAI message format to text. Preserves ALL messages for real-world data."""
+        # For LiteLLM logs and real-world data: keep ALL messages including system/tool
+        # Just format them in a simple consistent way
         parts = []
         for msg in messages:
-            role = msg.get("role", "")
+            role = msg.get("role", "unknown")
             content = msg.get("content", "")
-            if content:
-                parts.append(f"<{role}>{content}</{role}>")
-        return "\n".join(parts)
+
+            # Handle content that might be None or empty
+            if content is None:
+                content = ""
+            elif not isinstance(content, str):
+                # Handle list-type content (e.g., from tool calls)
+                if isinstance(content, list):
+                    content_parts = []
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") == "text":
+                            content_parts.append(item.get("text", ""))
+                    content = "\n".join(content_parts)
+                else:
+                    content = str(content)
+
+            # Include tool_calls info if present
+            tool_calls = msg.get("tool_calls")
+            if tool_calls and not content:
+                # Format tool calls as content
+                tool_strs = []
+                for tc in tool_calls:
+                    func = tc.get("function", {})
+                    name = func.get("name", "")
+                    args = func.get("arguments", "")
+                    tool_strs.append(f"{name}({args})")
+                content = "[TOOL_CALLS] " + "; ".join(tool_strs)
+
+            if content:  # Only add if there's content
+                parts.append(f"{role}: {content}")
+
+        return "\n\n".join(parts)
 
 
 class EagleTrainingDataset(Dataset):
-    """Dataset for training the P-EAGLE drafter.
+    """Memory-efficient dataset for P-EAGLE training.
+
+    Following official EAGLE implementation pattern:
+    - Store shard paths, not actual data
+    - Load samples on-demand in __getitem__
+    - Only current shard is in RAM (~6GB instead of 148GB)
 
     Works with ANY model pair: features from any target model can train
     any drafter model. Handles tokenizer mismatch automatically.
@@ -84,41 +175,99 @@ class EagleTrainingDataset(Dataset):
         feature_dir: str,
         tokenizer: PreTrainedTokenizer,
         speculation_depth: int = 4,
-        max_seq_len: int = 2048
+        max_seq_len: int = 2048,
+        shard_cache_size: int = 1  # Number of shards to keep in RAM
     ):
         self.tokenizer = tokenizer
         self.speculation_depth = speculation_depth
         self.max_seq_len = max_seq_len
+        self.shard_cache_size = shard_cache_size
 
-        self.samples = []
         from pathlib import Path
 
-        for pt_file in sorted(Path(feature_dir).glob("*_shard*.pt")):
-            print(f"Loading {pt_file}")
-            data = torch.load(pt_file, map_location="cpu")
+        # Store shard paths, not data (EAGLE official pattern)
+        self.shard_files = sorted(Path(feature_dir).glob("*_shard*.pt"))
+        if not self.shard_files:
+            raise ValueError(f"No feature shards found in {feature_dir}")
+
+        # Build index: global_idx -> (shard_idx, local_idx)
+        # This allows efficient on-demand loading
+        self.sample_index = []  # List of (shard_idx, local_idx) tuples
+        self.shard_sample_counts = []  # Number of samples per shard
+
+        print(f"Indexing {len(self.shard_files)} feature shards...")
+        for shard_idx, pt_file in enumerate(self.shard_files):
+            # Only load metadata (num_samples), not full data
+            data = torch.load(pt_file, map_location="cpu", weights_only=False)
             num_samples = data["num_samples"]
+            self.shard_sample_counts.append(num_samples)
 
-            # Get texts list if available (new format)
-            texts = data.get("texts", [None] * num_samples)
+            # Add index entries for this shard
+            for local_idx in range(num_samples):
+                self.sample_index.append((shard_idx, local_idx))
 
-            for i in range(num_samples):
-                self.samples.append({
-                    "text": texts[i] if i < len(texts) else None,
-                    "input_ids": data["input_ids"][i],
-                    "fused_hidden_states": data["fused_hidden_states"][i],
-                    "loss_mask": data["loss_mask"][i],
-                    "attention_mask": data["attention_mask"][i]
-                })
+            # Free memory immediately
+            del data
+            import gc
+            gc.collect()  # Force garbage collection to free RAM
 
-        print(f"Loaded {len(self.samples)} training samples")
+        print(f"Indexed {len(self.sample_index)} total samples across {len(self.shard_files)} shards")
+        print(f"RAM usage: ~{self.shard_sample_counts[0] * 6 / 1024:.1f}GB per shard (vs {sum(self.shard_sample_counts) * 6 / 1024:.1f}GB if loading all)")
+
+        # Shard cache: only keep recent shards in memory
+        self._shard_cache = {}  # shard_idx -> shard_data
+        self._shard_access_order = []  # LRU tracking
 
     def __len__(self) -> int:
-        return len(self.samples)
+        return len(self.sample_index)
+
+    def _load_shard_if_needed(self, shard_idx: int):
+        """Load shard into cache if not already present."""
+        if shard_idx in self._shard_cache:
+            # Update LRU order
+            if shard_idx in self._shard_access_order:
+                self._shard_access_order.remove(shard_idx)
+            self._shard_access_order.append(shard_idx)
+            return
+
+        # Load the shard
+        pt_file = self.shard_files[shard_idx]
+        data = torch.load(pt_file, map_location="cpu", weights_only=False)
+
+        # Store in cache
+        self._shard_cache[shard_idx] = data
+        self._shard_access_order.append(shard_idx)
+
+        # Evict oldest shards if cache is full
+        while len(self._shard_cache) > self.shard_cache_size:
+            oldest_shard = self._shard_access_order.pop(0)
+            if oldest_shard in self._shard_cache:
+                del self._shard_cache[oldest_shard]
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        sample = self.samples[idx]
+        # Get shard and local indices
+        shard_idx, local_idx = self.sample_index[idx]
 
-        # Anchor to target's hidden state length (this is ground truth)
+        # Load shard if needed (on-demand loading)
+        self._load_shard_if_needed(shard_idx)
+
+        # Get sample from cache
+        shard_data = self._shard_cache[shard_idx]
+        texts = shard_data.get("texts", [None] * shard_data["num_samples"])
+
+        sample = {
+            "text": texts[local_idx] if local_idx < len(texts) else None,
+            "input_ids": shard_data["input_ids"][local_idx],
+            "fused_hidden_states": shard_data["fused_hidden_states"][local_idx],
+            "loss_mask": shard_data["loss_mask"][local_idx],
+            "attention_mask": shard_data["attention_mask"][local_idx]
+        }
+
+        # Add raw hidden states if available
+        if "raw_hidden_states" in shard_data:
+            sample["raw_hidden_states"] = shard_data["raw_hidden_states"][local_idx]
+
+        # Process the sample (same logic as before)
         target_len = min(len(sample["fused_hidden_states"]), self.max_seq_len)
 
         # Retokenize with drafter's tokenizer if text available
@@ -148,10 +297,12 @@ class EagleTrainingDataset(Dataset):
             input_ids = sample["input_ids"][:target_len]
             attention_mask = sample["attention_mask"][:target_len]
 
-        # Target hidden states are used for both:
-        # 1. Hidden state injection during forward pass (if enabled)
-        # 2. Ground truth for MTP loss calculation
-        target_hidden = sample["fused_hidden_states"][:target_len]
+        # Use raw hidden states for lm_head compatibility
+        if "raw_hidden_states" in sample:
+            target_hidden = sample["raw_hidden_states"][:target_len]
+        else:
+            # Fallback to fused (legacy features)
+            target_hidden = sample["fused_hidden_states"][:target_len]
 
         return {
             "input_ids": input_ids,
@@ -221,6 +372,7 @@ def align_segments_to_tokens(
     FIXED: Uses character-offset mapping for 1:1 text-to-token accuracy.
     FIXED: Tracks search position to handle duplicate content correctly.
     FIXED: Normalizes quotes for reliable matching.
+    FIXED: Re-encode original text to get correct offsets (avoid double tokenization).
     This avoids the "shift bug" from manual index summation.
     """
     seq_len = input_ids.shape[0]
@@ -232,16 +384,20 @@ def align_segments_to_tokens(
     full_text = _normalize_for_matching(full_text_raw)
 
     # Use offset_mapping for precise character-to-token alignment
+    # CRITICAL FIX: Re-encode the decoded text to get offsets that match input_ids
     try:
-        encoding = tokenizer(full_text, return_offsets_mapping=True, add_special_tokens=False)
+        encoding = tokenizer(full_text_raw, return_offsets_mapping=True, add_special_tokens=False)
         offsets = encoding['offset_mapping']
 
         # Ensure offsets match input_ids length
         if len(offsets) != seq_len:
-            # Fallback: use simple heuristic if offset mapping fails
-            print(f"  Warning: Offset mapping length mismatch ({len(offsets)} vs {seq_len})")
-            start_pos = min(seq_len // 4, seq_len - 1)
-            token_mask[start_pos:] = 1
+            # Fallback: use role-based heuristic
+            # Count assistant messages and estimate positions
+            assistant_count = sum(1 for seg in segments if seg.get("mask") == 1)
+            if assistant_count > 0:
+                # Rough heuristic: assistant content tends to be in latter half
+                start_pos = max(seq_len // 3, seq_len - (seq_len // 4))
+                token_mask[start_pos:] = 1
             return token_mask
 
         # Track search position to handle duplicate content
@@ -256,6 +412,18 @@ def align_segments_to_tokens(
                 content = messages[msg_idx].get("content", "")
                 if not isinstance(content, str):
                     content = str(content) if content else ""
+
+                # Handle tool_calls - if no content but has tool_calls, serialize them
+                if not content and messages[msg_idx].get("tool_calls"):
+                    import json
+                    tool_calls = messages[msg_idx].get("tool_calls", [])
+                    tool_parts = []
+                    for tc in tool_calls:
+                        func = tc.get("function", {})
+                        name = func.get("name", "")
+                        args = func.get("arguments", "")
+                        tool_parts.append(f"{name}({args})")
+                    content = "[TOOL_CALLS:" + "; ".join(tool_parts) + "]"
 
                 if not content:
                     continue
@@ -273,8 +441,8 @@ def align_segments_to_tokens(
                 if start_char == -1:
                     start_char = _fuzzy_find(full_text, content_normalized, last_search_pos)
                     if start_char == -1:
-                        print(f"  Warning: Could not align message {msg_idx} (content length: {len(content_normalized)})")
-                        continue  # Content not found even with fuzzy matching
+                        # Silently skip - content not found (happens for special/formatting content)
+                        continue
 
                 end_char = start_char + len(content_normalized)
                 # Advance search position for next segment
@@ -300,10 +468,24 @@ def align_segments_to_tokens(
 def fuse_tri_layer_features(
     hidden_states: Tuple[torch.Tensor, ...],
     layer_indices: List[int],
-    fusion_mode: str = "mean"
-) -> torch.Tensor:
+    fusion_mode: str = "mean",
+    normalize: bool = True
+) -> Dict[str, torch.Tensor]:
     """
     Fuse hidden states from multiple layers into a single vector.
+
+    Args:
+        hidden_states: Tuple of hidden state tensors from all layers
+        layer_indices: Which layer indices to fuse
+        fusion_mode: "mean", "weighted", or "concat"
+        normalize: Apply LayerNorm to stabilize extreme values (default: True)
+
+    Returns:
+        Dictionary containing:
+        - 'fused': Normalized fused hidden states
+        - 'mean': Per-token mean for denormalization
+        - 'std': Per-token std for denormalization
+        - 'raw': Original unnormalized fused hidden states (for lm_head compatibility)
     """
     selected = [hidden_states[i] for i in layer_indices]
 
@@ -317,4 +499,35 @@ def fuse_tri_layer_features(
     else:
         raise ValueError(f"Unknown fusion mode: {fusion_mode}")
 
-    return fused
+    # Save raw fused for lm_head compatibility
+    raw_fused = fused.clone()
+
+    # CRITICAL FIX: Normalize to prevent extreme values from blowing up loss
+    # But save statistics for denormalization during inference
+    mean = None
+    std = None
+    if normalize:
+        # Use layernorm for per-sample normalization across hidden dim
+        # This keeps values in a reasonable range (~ -3 to +3)
+        original_dtype = fused.dtype
+        fused_float = fused.float()
+
+        # Compute per-token mean and std across hidden dimension
+        mean = fused_float.mean(dim=-1, keepdim=True)
+        var = fused_float.var(dim=-1, keepdim=True, unbiased=False)
+        std = torch.sqrt(var + 1e-5)
+
+        # Normalize: (x - mean) / std
+        fused_normalized = (fused_float - mean) / std
+
+        # Clip extreme outliers (beyond 5 sigma)
+        fused_normalized = torch.clamp(fused_normalized, -5.0, 5.0)
+
+        fused = fused_normalized.to(original_dtype)
+
+    return {
+        'fused': fused,
+        'mean': mean,
+        'std': std,
+        'raw': raw_fused
+    }

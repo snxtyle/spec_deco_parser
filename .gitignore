@@ -9,7 +9,8 @@ data/output/
 venv/
 checkpoints/
 models_cache/
-checkpoints_gemma/
+checkpoints_peagle
+reference.md
 __pycache__
 # Output directory
 output/*
@@ -25,4 +26,4 @@ __pycache__/
 
 # Claude
 .claude
-
+.vscode

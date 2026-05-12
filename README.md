@@ -20,7 +20,7 @@ pip install -r requirements.txt
 ./run_full_pipeline.sh
 
 # Or with custom models
-./run_full_pipeline.sh --target google/gemma-7b-it --drafter google/gemma-2b-it
+./run_full_pipeline.sh --target google/gemma-3-4b-it --drafter google/gemma-3-270m-it
 
 # Dry-run to preview commands without executing
 ./run_full_pipeline.sh --dry-run
@@ -30,7 +30,7 @@ pip install -r requirements.txt
 
 | Flag | Description |
 |------|-------------|
-| `--target MODEL` | Target model (default: google/gemma-7b-it) |
+| `--target MODEL` | Target model (default: google/gemma-3-4b-it) |
 | `--drafter MODEL` | Drafter model (default: google/gemma-3-270m-it) |
 | `--skip-data-gen` | Skip data generation stage |
 | `--skip-feature-extraction` | Skip feature extraction stage |
@@ -54,8 +54,8 @@ python scripts/generate_data.py --local --num-samples 5000 \
 
 # 3. Extract features from target model
 python -m p_eagle.scripts.extract_features \
-    --model_path google/gemma-7b-it \
-    --tokenizer_path google/gemma-2b-it \
+    --model_path google/gemma-3-4b-it \
+    --tokenizer_path google/gemma-3-270m-it \
     --input_data data/output/dataset.jsonl \
     --output_dir data/features \
     --quantization 8bit \
@@ -63,8 +63,8 @@ python -m p_eagle.scripts.extract_features \
 
 # 4. Train drafter model
 python -m p_eagle.scripts.train_drafter \
-    --drafter_model google/gemma-2b-it \
-    --target_hidden_dim 3072 \
+    --drafter_model google/gemma-3-270m-it \
+    --target_hidden_dim 2560 \
     --feature_dir data/features \
     --output_dir checkpoints \
     --num_epochs 50 \
@@ -75,12 +75,12 @@ python -m p_eagle.scripts.train_drafter \
 # 5. Evaluate
 python -m p_eagle.scripts.evaluate \
     --drafter_checkpoint checkpoints/best_model \
-    --target_model google/gemma-7b-it \
+    --target_model google/gemma-3-4b-it \
     --baseline --max_tokens 100
 
 # 6. Run inference
 python -m p_eagle.scripts.run_inference \
-    --target_model google/gemma-7b-it \
+    --target_model google/gemma-3-4b-it \
     --drafter_checkpoint checkpoints/best_model \
     --prompt "Explain quantum computing"
 ```
@@ -98,29 +98,35 @@ python -m p_eagle.scripts.run_inference \
 
 ## Architecture
 
+P-EAGLE implements the **EAGLE-3** architecture with hidden state injection:
+
 ```
-TARGET MODEL (e.g., Gemma-7B, 28 layers, 3072 hidden dim)
+TARGET MODEL (e.g., Gemma-3-4B, 26 layers, 2560 hidden dim)
          |
-         |  features (layers 7, 14, 21 fused)
+         |  features (layers 6, 13, 19 fused)
          v
-DRAFTER MODEL (e.g., Qwen-1.5B, 1536 hidden dim)
-    +-----------------------------+
-    |  Base LLM (frozen + LoRA)   |
-    |       (1536 dim)            |
-    +-------------+---------------+
-                  |
-          Dim Projection
-         (1536 -> 3072)
-                  |
-    +-------------+-------------+
-    |             |             |
-    v             v             v
- MTP Head 1   MTP Head 2   MTP Head K
- (h_{t+1})    (h_{t+2})    (h_{t+K})
+DRAFTER MODEL (e.g., Gemma-3-270M, 1536 hidden dim)
+    +-------------------------------------------+
+    |  FIRST LAYER: Accepts 2x hidden size      |
+    |  [token_embeds; target_hidden] concat     |
+    |                                           |
+    |  Base LLM (frozen + LoRA)                 |
+    |  Hidden Injection: concat → split → norm  |
+    +--------------------+----------------------+
+                         |
+                 Dim Projection
+                (1536 -> 2560)
+                         |
+         +---------------+---------------+
+         |               |               |
+         v               v               v
+   MTP Head 1     MTP Head 2     MTP Head K
+   (h_{t+1})      (h_{t+2})      (h_{t+K})
 ```
 
 **Key Components:**
-- **Tri-Layer Fusion**: Combines early, middle, and final layer features
+- **EAGLE-3 Hidden Injection**: First layer accepts concatenated [embeddings; target_hidden]
+- **Tri-Layer Fusion**: Combines early, middle, and final layer features from target
 - **Multi-Token Prediction (MTP)**: K parallel heads predict future hidden states
 - **Tree Attention**: Verifies K tokens in single target forward pass
 
@@ -134,8 +140,8 @@ Extract tri-layer fused hidden states from the target model.
 
 ```bash
 python -m p_eagle.scripts.extract_features \
-    --model_path google/gemma-7b \
-    --tokenizer_path google/gemma-2b \
+    --model_path google/gemma-3-4b-it \
+    --tokenizer_path google/gemma-3-270m-it \
     --input_data data/output/dataset.jsonl \
     --output_dir data/features \
     --quantization 8bit \
@@ -196,8 +202,8 @@ Train a small model to predict target model's hidden states.
 
 ```bash
 python -m p_eagle.scripts.train_drafter \
-    --drafter_model Qwen/Qwen2.5-1.5B-Instruct \
-    --target_hidden_dim 3072 \
+    --drafter_model google/gemma-3-270m-it \
+    --target_hidden_dim 2560 \
     --feature_dir data/features \
     --output_dir checkpoints \
     --epochs 50 \
@@ -239,7 +245,7 @@ Run speculative decoding with trained drafter.
 
 ```bash
 python -m p_eagle.scripts.run_inference \
-    --target_model google/gemma-7b \
+    --target_model google/gemma-3-4b-it \
     --drafter_checkpoint checkpoints/best_model \
     --prompt "Explain neural networks" \
     --max_tokens 200 \
@@ -253,7 +259,7 @@ from p_eagle.inference import PEAGLEInference
 
 # Initialize engine
 engine = PEAGLEInference(
-    target_model_name="google/gemma-7b",
+    target_model_name="google/gemma-3-4b-it",
     drafter_checkpoint="./checkpoints/best_model"
 )
 
@@ -310,10 +316,10 @@ Get token from: https://huggingface.co/settings/tokens
 
 | Target Model | Hidden Dim | Compatible Drafters |
 |--------------|-----------|---------------------|
-| Gemma-7B | 3072 | Qwen2.5-1.5B, TinyLlama-1.1B |
+| Gemma-3-4B | 2560 | Gemma-3-270M, Qwen2.5-1.5B |
+| Gemma-7B | 3072 | Gemma-2B, Qwen2.5-1.5B |
 | Llama-2-7B | 4096 | Qwen2.5-1.5B, Phi-2 |
 | Mistral-7B | 4096 | Qwen2.5-1.5B, Phi-2 |
-| Qwen2.5-7B | 3584 | Qwen2.5-1.5B |
 
 **Rule:** Drafter hidden dim ≠ Target hidden dim. The `dim_projection` layer handles the mismatch.
 
@@ -338,7 +344,7 @@ Higher K = more parallelism but diminishing returns if acceptance drops.
 
 ## Visualizations
 
-Generate plots for the Gemma 2B IT → Gemma 7B model pair:
+Generate plots for the Gemma-3-270M → Gemma-3-4B model pair:
 
 ```bash
 python -m plot_scripts.generate_plots
@@ -374,13 +380,13 @@ On NVIDIA A100-80GB, batch_size=1:
 
 | Target | Drafter | K | MAL | Speedup |
 |--------|---------|---|-----|---------|
+| Gemma-3-4B | Gemma-3-270M | 4 | 2.8 | 1.8x |
 | Gemma-7B | Qwen-1.5B | 4 | 3.2 | 2.1x |
 | Llama-2-7B | Qwen-1.5B | 4 | 2.9 | 1.9x |
-| Mistral-7B | Phi-2 | 4 | 3.0 | 1.8x |
 
 ### Latest Evaluation (April 2026)
 
-Evaluated P-EAGLE drafter on `google/gemma-7b` with K=4:
+Evaluated P-EAGLE drafter on `google/gemma-3-4b-it` with K=4:
 
 | Metric | Value |
 |--------|-------|
@@ -400,10 +406,9 @@ Evaluated P-EAGLE drafter on `google/gemma-7b` with K=4:
 p_eagle/
 ├── p_eagle/                      # Main package
 │   ├── data_preparation/         # Data processing
-│   │   ├── data_manager.py       # EAGLEDistiller
-│   │   └── secret_scanner.py     # PII scanner
+│   │   └── data_manager.py       # EAGLEDistiller, SmartSecretScanner
 │   ├── models/                   # Neural networks
-│   │   ├── eagle_drafter.py      # Drafter + MTP heads
+│   │   ├── peagle_drafter.py     # P-EAGLE Drafter + MTP heads (EAGLE-3)
 │   │   └── tree_attention.py     # Tree attention masks
 │   ├── training/                 # Training & extraction
 │   │   ├── feature_extractor.py  # Tri-layer extraction
@@ -415,12 +420,10 @@ p_eagle/
 │   │   ├── loss_utils.py         # Loss functions
 │   │   └── metrics.py            # Evaluation metrics
 │   └── scripts/                  # CLI entry points
-│       ├── extract_features.py
-│       ├── train_drafter.py
-│       ├── run_inference.py
-│       ├── evaluate.py
-│       ├── plot_metrics.py       # Legacy plotting
-│       └── compare_models.py     # Legacy comparison
+│       ├── extract_features.py   # Feature extraction wrapper
+│       ├── train_drafter.py      # Training wrapper
+│       ├── run_inference.py      # Inference wrapper
+│       └── evaluate.py           # Evaluation script
 ├── plot_scripts/                 # Visualization scripts
 │   ├── __init__.py
 │   ├── utils.py                  # Data loading utilities
@@ -434,7 +437,8 @@ p_eagle/
 │       ├── *_acceptance.png
 │       └── *_dashboard.png
 ├── scripts/                      # Standalone scripts
-│   └── generate_data.py          # Dataset generation
+│   ├── generate_data.py          # Dataset generation
+│   └── preflight_check.py        # Pre-training validation
 ├── data/                         # Data directories
 │   ├── raw/                      # Raw logs
 │   ├── processed/                # Intermediate
@@ -448,7 +452,25 @@ p_eagle/
 
 ---
 
-## Recent Fixes (May 2026)
+## Recent Changes (May 2026)
+
+### Architecture Update: EAGLE-3 with Hidden State Injection
+**Change:** Implemented EAGLE-3 architecture with proper hidden state injection via concatenation.
+- First layer modified to accept 2x hidden size input `[token_embeds; target_hidden]`
+- Separate normalization for embeddings and hidden states
+- Output projection to match residual dimensions
+- Model file renamed from `eagle_drafter.py` to `peagle_drafter.py`
+
+### Code Cleanup
+**Removed:** Temporary diagnostic scripts that were cluttering the repository:
+- `scripts/check_features_only.py`
+- `scripts/verify_data.py`
+- `scripts/verify_and_fix.py`
+- `scripts/verify_training_setup.py`
+
+**Kept:** Core workflow scripts:
+- `scripts/generate_data.py` - Dataset generation
+- `scripts/preflight_check.py` - Pre-training validation
 
 ### Critical Fix: loss_mask_segments
 **Problem:** Dataset generation was missing `loss_mask_segments`, causing training loss to be 0 and MAL to stay at 1.0.  
@@ -464,7 +486,7 @@ p_eagle/
 
 ### Training/Inference Alignment
 **Problem:** Hidden state injection mode could mismatch between training and inference.  
-**Fix:** Both now use `use_hidden_injection=False` by default for consistency.
+**Fix:** Both now use consistent hidden injection configuration for alignment.
 
 ---
 

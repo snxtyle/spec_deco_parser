@@ -28,13 +28,28 @@ def check_stage1_dataset(dataset_path: str) -> tuple[bool, dict]:
     except Exception as e:
         return False, {"error": f"Cannot read dataset: {e}"}
 
-    # Check required fields
+    # Check required fields - support both formats
+    has_segments_root = "segments" in sample
+    has_loss_mask_segments = "loss_mask_segments" in sample
+    has_messages = "messages" in sample or "original_messages" in sample
+
     checks = {
-        "has_messages": "messages" in sample,
-        "has_loss_mask_segments": "loss_mask_segments" in sample,
-        "has_train_indices": "train_indices" in sample.get("loss_mask_segments", {}),
-        "has_nonzero_train_indices": len(sample.get("loss_mask_segments", {}).get("train_indices", [])) > 0
+        "has_messages": has_messages,
+        "has_segments": has_segments_root or has_loss_mask_segments,
     }
+
+    # Count trainable segments
+    train_count = 0
+    if has_segments_root:
+        segments = sample.get("segments", [])
+        train_count = sum(1 for s in segments if s.get("mask") == 1)
+        checks["has_trainable_segments"] = train_count > 0
+    elif has_loss_mask_segments:
+        lms = sample.get("loss_mask_segments", {})
+        train_count = len(lms.get("train_indices", []))
+        checks["has_trainable_segments"] = train_count > 0
+    else:
+        checks["has_trainable_segments"] = False
 
     for check, passed in checks.items():
         status = "✅" if passed else "❌"
@@ -43,11 +58,10 @@ def check_stage1_dataset(dataset_path: str) -> tuple[bool, dict]:
     all_passed = all(checks.values())
 
     if all_passed:
-        train_count = len(sample["loss_mask_segments"]["train_indices"])
-        msg_count = len(sample["messages"])
+        msg_count = len(sample.get("messages") or sample.get("original_messages", []))
         print(f"\n  Sample stats:")
         print(f"    - Messages: {msg_count}")
-        print(f"    - Trainable messages: {train_count}")
+        print(f"    - Trainable segments: {train_count}")
 
     return all_passed, checks
 
@@ -114,7 +128,7 @@ def check_stage2_feature_compatibility(
         with open(dataset_path, 'r') as f:
             sample = json.loads(f.readline())
 
-        messages = sample["messages"]
+        messages = sample.get("messages") or sample.get("original_messages", [])
         conversation_text = "\n".join([
             f"<{m['role']}>{m.get('content', '')}</{m['role']}>"
             for m in messages if m.get('content')

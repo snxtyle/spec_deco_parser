@@ -1,341 +1,214 @@
 #!/usr/bin/env python3
-"""P-EAGLE Inference Engine"""
+"""
+P-EAGLE Inference Script
+
+Correct architecture: Drafter predicts hidden states → Target's lm_head → Tokens
+"""
 
 import argparse
 import time
-from dataclasses import dataclass
-from typing import List, Dict, Tuple, Optional
+import sys
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-from ..models.eagle_drafter import EagleDrafterModel
-from ..models.tree_attention import TreeAttentionMask
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+from p_eagle.models.peagle_drafter import EagleDrafterModel
 
 
-@dataclass
-class GenerationMetrics:
-    total_tokens: int
-    accepted_tokens: int
-    target_forward_passes: int
-    drafter_forward_passes: int
-    mean_acceptance_length: float
-    speedup: float
-    wall_time: float
+def run_inference(
+    target_model_name: str,
+    drafter_checkpoint: str,
+    prompt: str,
+    max_new_tokens: int = 100,
+    temperature: float = 1.0,
+    device: str = "cuda",
+):
+    """Run P-EAGLE inference with correct hidden state prediction."""
 
+    print(f"Loading target model: {target_model_name}")
+    tokenizer = AutoTokenizer.from_pretrained(target_model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
-class PEAGLEInference:
-    """P-EAGLE Parallel Speculative Decoding Inference Engine."""
+    # Disable CUDA graphs to avoid dynamic shape issues with TorchInductor
+    torch._inductor.config.triton.cudagraphs = False
 
-    def __init__(
-        self,
-        target_model_name: str,
-        drafter_checkpoint: str,
-        device: str = "cuda",
-        dtype: torch.dtype = torch.bfloat16,
-        use_hidden_injection: bool = False  # Must match training - always False
-    ):
-        self.device = device
-        self.dtype = dtype
-        self.use_hidden_injection = use_hidden_injection
+    target_model = AutoModelForCausalLM.from_pretrained(
+        target_model_name,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+    )
+    target_model.eval()
 
-        print(f"Loading target model: {target_model_name}")
-        self.target_tokenizer = AutoTokenizer.from_pretrained(target_model_name)
-        if self.target_tokenizer.pad_token is None:
-            self.target_tokenizer.pad_token = self.target_tokenizer.eos_token
+    # Get target's lm_head for converting hidden states to tokens
+    if hasattr(target_model, 'lm_head'):
+        target_lm_head_fallback = target_model.lm_head
+    elif hasattr(target_model, 'model') and hasattr(target_model.model, 'lm_head'):
+        target_lm_head_fallback = target_model.model.lm_head
+    else:
+        raise ValueError("Could not find lm_head in target model")
 
-        self.target_model = AutoModelForCausalLM.from_pretrained(
-            target_model_name,
-            torch_dtype=dtype,
-            device_map="auto",
-            output_hidden_states=True
-        )
-        self.target_model.eval()
+    print(f"Loading P-EAGLE drafter: {drafter_checkpoint}")
+    drafter = EagleDrafterModel.load_checkpoint(drafter_checkpoint, device=device)
+    drafter.eval()
 
-        # Handle Gemma 3 config structure (has nested text_config)
-        if hasattr(self.target_model.config, 'hidden_size'):
-            self.target_hidden_dim = self.target_model.config.hidden_size
-        elif hasattr(self.target_model.config, 'text_config') and hasattr(self.target_model.config.text_config, 'hidden_size'):
-            self.target_hidden_dim = self.target_model.config.text_config.hidden_size
-        else:
-            raise AttributeError(f"Cannot find hidden_size in model config: {self.target_model.config}")
+    # Use saved lm_head from checkpoint if available (for vocab compatibility)
+    if hasattr(drafter, 'target_lm_head') and drafter.target_lm_head is not None:
+        target_lm_head = drafter.target_lm_head
+        print(f"Using saved lm_head from checkpoint (vocab: {target_lm_head.weight.shape[0]})")
+    else:
+        target_lm_head = target_lm_head_fallback
+        print(f"Using target model's lm_head (vocab: {target_lm_head.weight.shape[0]})")
+        print("WARNING: Vocab mismatch possible if training used different tokenizer")
 
-        print(f"Loading drafter from: {drafter_checkpoint}")
-        self.drafter = EagleDrafterModel.load_checkpoint(drafter_checkpoint, device=device)
-        self.drafter.eval()
+    speculation_depth = drafter.speculation_depth
+    print(f"Speculation depth (K): {speculation_depth}")
 
-        self.speculation_depth = self.drafter.speculation_depth
-        self.acceptance_history = []
+    # Try to load saved lm_head from checkpoint for vocab compatibility
+    import json
+    from pathlib import Path
+    checkpoint_path = Path(drafter_checkpoint)
+    config_path = checkpoint_path / "config.json"
 
-        # Initialize tree attention for parallel verification
-        self.tree_attention = TreeAttentionMask(self.speculation_depth)
+    if config_path.exists():
+        with open(config_path) as f:
+            config = json.load(f)
+        saved_vocab_size = config.get("vocab_size", None)
+        current_vocab_size = len(tokenizer)
 
-        print(f"P-EAGLE initialized: Target={target_model_name}, K={self.speculation_depth}")
-        if use_hidden_injection:
-            print("  Hidden state injection: ENABLED")
+        if saved_vocab_size and saved_vocab_size != current_vocab_size:
+            print(f"WARNING: Vocab size mismatch!")
+            print(f"  Saved (training): {saved_vocab_size}")
+            print(f"  Current (target): {current_vocab_size}")
+            print(f"  Using target model's lm_head with {current_vocab_size} vocab")
+            print(f"  This may cause token ID mismatches!")
 
-    @torch.no_grad()
-    def generate(
-        self,
-        prompt: str,
-        max_new_tokens: int = 100,
-        temperature: float = 1.0,
-        top_p: float = 0.9
-    ) -> Tuple[str, GenerationMetrics]:
-        """Generate text using parallel speculative decoding with hidden state injection."""
-        input_ids = self.target_tokenizer.encode(prompt, return_tensors="pt").to(self.device)
-        original_length = input_ids.shape[1]
+    # Encode prompt
+    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+    original_length = input_ids.shape[1]
 
-        total_draft_tokens = 0
-        total_accepted_tokens = 0
-        target_passes = 0
-        drafter_passes = 0
+    print(f"\nPrompt: {prompt}")
+    print(f"Prompt tokens: {original_length}")
+    print("-" * 50)
 
-        start_time = time.time()
-        generated = input_ids.clone()
+    # Generation loop
+    generated = input_ids.clone()
+    total_draft_tokens = 0
+    total_accepted = 0
+    target_passes = 0
 
-        # Store target hidden state for injection loop
-        prev_target_hidden = None
+    start_time = time.time()
 
-        for _ in range(max_new_tokens):
-            if generated.shape[1] >= original_length + max_new_tokens:
+    for step in range(max_new_tokens):
+        if generated.shape[1] >= original_length + max_new_tokens:
+            break
+
+        # EAGLE: First get target model's hidden state at current position
+        with torch.no_grad():
+            target_outputs = target_model(generated, output_hidden_states=True)
+            target_hidden = target_outputs.hidden_states[-1]  # [batch, seq_len, hidden_dim]
+
+        # Generate K draft hidden states using drafter with EAGLE-3 hidden injection
+        # CRITICAL: Pass target_hidden for concatenation at first layer
+        with torch.no_grad():
+            drafter_outputs = drafter.forward(
+                input_ids=generated,
+                target_hidden=target_hidden,  # EAGLE-3: Concatenation injection
+                is_training=False
+            )
+            # mtp_predictions is a list of K tensors, each [batch, 1, target_hidden_dim]
+            mtp_predictions = drafter_outputs["mtp_predictions"]
+
+        # Convert predicted hidden states to tokens using target's lm_head
+        draft_tokens = []
+        for k in range(min(speculation_depth, max_new_tokens - (generated.shape[1] - original_length))):
+            # Get predicted hidden for position k
+            pred_hidden = mtp_predictions[k]  # [batch, 1, target_hidden_dim]
+
+            # Pass through target's lm_head to get logits
+            logits = target_lm_head(pred_hidden)  # [batch, 1, vocab_size]
+
+            # Greedy decode
+            token_id = torch.argmax(logits, dim=-1)  # [batch, 1]
+            draft_tokens.append(token_id.item())
+
+        total_draft_tokens += len(draft_tokens)
+
+        # Verify with target model
+        draft_tensor = torch.tensor([draft_tokens], device=device)
+        verification_input = torch.cat([generated, draft_tensor], dim=1)
+
+        with torch.no_grad():
+            verify_outputs = target_model(verification_input)
+            verify_logits = verify_outputs.logits[0, generated.shape[1]-1:, :]
+
+        # Accept tokens greedily
+        accepted = []
+        for i, draft_token in enumerate(draft_tokens):
+            target_token = torch.argmax(verify_logits[i]).item()
+            if draft_token == target_token:
+                accepted.append(draft_token)
+                total_accepted += 1
+            else:
+                # Accept target's choice
+                accepted.append(target_token)
                 break
 
-            # Draft K tokens (with optional hidden state injection)
-            # CRITICAL: Ensure hidden state is on drafter's device for injection
-            target_hidden_for_drafter = None
-            if self.use_hidden_injection and prev_target_hidden is not None:
-                target_hidden_for_drafter = prev_target_hidden.to(self.drafter.device)
+        if accepted:
+            new_tokens = torch.tensor([accepted], device=device)
+            generated = torch.cat([generated, new_tokens], dim=1)
 
-            draft_tokens, _, prev_target_hidden = self._generate_draft_parallel(
-                generated,
-                self.speculation_depth,
-                target_hidden_for_drafter
-            )
-            drafter_passes += 1
-            total_draft_tokens += len(draft_tokens)
+        target_passes += 1
 
-            # Verify with target (returns verified tokens and hidden state for next iteration)
-            accepted, verified_tokens, prev_target_hidden = self._verify_parallel(
-                generated,
-                draft_tokens,
-                temperature
-            )
-            target_passes += 1
-
-            total_accepted_tokens += accepted
-            self.acceptance_history.append(accepted)
-
-            if len(verified_tokens) > 0:
-                new_tokens = torch.tensor([verified_tokens], device=self.device)
-                generated = torch.cat([generated, new_tokens], dim=1)
-            else:
-                # Fallback
-                next_token = self._sample_from_target(generated, temperature, top_p)
-                generated = torch.cat([generated, next_token], dim=1)
-                # Reset hidden state injection on fallback
-                prev_target_hidden = None
-
-        wall_time = time.time() - start_time
-        output_text = self.target_tokenizer.decode(
+        # Print progress
+        current_text = tokenizer.decode(
             generated[0][original_length:], skip_special_tokens=True
         )
+        print(f"\rStep {step+1}: {len(accepted)} tokens accepted", end="")
 
-        metrics = GenerationMetrics(
-            total_tokens=generated.shape[1] - original_length,
-            accepted_tokens=total_accepted_tokens,
-            target_forward_passes=target_passes,
-            drafter_forward_passes=drafter_passes,
-            mean_acceptance_length=sum(self.acceptance_history) / len(self.acceptance_history) if self.acceptance_history else 0.0,
-            speedup=total_accepted_tokens / target_passes if target_passes > 0 else 1.0,
-            wall_time=wall_time
-        )
+    wall_time = time.time() - start_time
+    print("\n" + "-" * 50)
 
-        return output_text, metrics
+    # Final output
+    output_text = tokenizer.decode(
+        generated[0][original_length:], skip_special_tokens=True
+    )
 
-    def _generate_draft_parallel(
-        self,
-        input_ids: torch.Tensor,
-        k: int,
-        target_hidden: Optional[torch.Tensor] = None
-    ) -> Tuple[List[int], Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Generate K draft tokens using parallel MTP heads.
-
-        All K predictions are made in a SINGLE forward pass from the current position,
-        matching how the MTP heads were trained. Each head predicts h_{t+k+1} from h_t.
-
-        Args:
-            input_ids: Current sequence [batch, seq_len]
-            k: Number of tokens to draft
-            target_hidden: Optional target hidden states from previous verification
-
-        Returns:
-            draft_tokens: List of drafted token IDs
-            last_logits: Logits from the last drafted token
-            drafter_hidden: Last drafter hidden state
-        """
-        # SINGLE forward pass through drafter
-        outputs = self.drafter(
-            input_ids,
-            output_hidden_states=True,
-            target_hidden=target_hidden if self.use_hidden_injection else None,
-            is_training=False
-        )
-
-        draft_tokens = []
-        last_logits = None
-
-        # Extract predictions from all K MTP heads in parallel
-        num_heads = min(k, len(outputs["mtp_predictions"]))
-        for i in range(num_heads):
-            # Get prediction from head i (predicts token at position t+i+1)
-            pred_hidden = outputs["mtp_predictions"][i]
-            # Take the last position prediction
-            pred_hidden_last = pred_hidden[:, -1:, :]
-
-            # Convert to logits using target's lm_head
-            logits = self._hidden_to_logits(pred_hidden_last)
-            last_logits = logits
-
-            # Get token (greedy for drafting)
-            probs = F.softmax(logits[0, 0], dim=-1)
-            token = torch.argmax(probs).item()
-            draft_tokens.append(token)
-
-        # Get final hidden state for injection loop
-        drafter_hidden = outputs["projected_hidden"][:, -1:]
-
-        return draft_tokens, last_logits, drafter_hidden
-
-    def _verify_parallel(
-        self,
-        input_ids: torch.Tensor,
-        draft_tokens: List[int],
-        temperature: float,
-        acceptance_threshold: float = 0.6
-    ) -> Tuple[int, List[int], Optional[torch.Tensor]]:
-        """Verify draft tokens using parallel forward pass.
-
-        IMPROVED VERIFICATION: Uses modified rejection sampling for better acceptance
-        rates while maintaining output quality. More lenient threshold (0.6) to
-        improve MAL when drafter is reasonably accurate.
-
-        Args:
-            input_ids: Current sequence
-            draft_tokens: Drafted token IDs to verify
-            temperature: Sampling temperature
-            acceptance_threshold: Min probability ratio to accept draft (0.6 = 60%)
-
-        Returns:
-            num_accepted: Number of accepted tokens
-            verified_tokens: List of verified token IDs
-            target_hidden: Last hidden state for injection loop
-        """
-        draft_tensor = torch.tensor([draft_tokens], device=self.device)
-        verification_input = torch.cat([input_ids, draft_tensor], dim=1)
-
-        # Single forward pass - let model handle attention mask
-        outputs = self.target_model(
-            input_ids=verification_input,
-            output_hidden_states=True
-        )
-
-        seq_len = input_ids.shape[1]
-        num_draft = len(draft_tokens)
-
-        # Get logits for all speculative positions at once
-        logits = outputs.logits[0, seq_len-1:seq_len+num_draft-1]
-
-        verified_tokens = []
-        for i in range(min(num_draft, logits.shape[0])):
-            # Get target's probability distribution
-            probs = F.softmax(logits[i] / temperature, dim=-1)
-            target_token = torch.argmax(probs).item()
-            target_prob = probs[target_token].item()
-            draft_prob = probs[draft_tokens[i]].item()
-
-            # IMPROVED ACCEPTANCE: More lenient criteria for better MAL
-            if draft_tokens[i] == target_token:
-                # Exact match - definitely accept
-                verified_tokens.append(draft_tokens[i])
-            elif draft_prob >= acceptance_threshold * target_prob:
-                # Draft token has similar probability to target's choice (>60%)
-                # Lowered from 0.8 to improve MAL while maintaining quality
-                verified_tokens.append(draft_tokens[i])
-            elif draft_prob > 0.1 and temperature > 0.5:
-                # High uncertainty scenario: accept if draft is in top 10%
-                # and we're sampling (not greedy)
-                verified_tokens.append(draft_tokens[i])
-            else:
-                # Target model strongly disagrees - accept up to this point and use target's choice
-                verified_tokens.append(target_token)
-                break
-
-        # Extract hidden state at the last verified position for injection loop
-        target_hidden = None
-        if self.use_hidden_injection and hasattr(outputs, 'hidden_states'):
-            last_layer_hidden = outputs.hidden_states[-1]
-            last_verified_pos = seq_len + len(verified_tokens) - 1
-            target_hidden = last_layer_hidden[:, :last_verified_pos+1, :]
-
-        return len(verified_tokens), verified_tokens, target_hidden
-
-    def _hidden_to_logits(self, hidden):
-        if hasattr(self.target_model, 'lm_head'):
-            return self.target_model.lm_head(hidden)
-        return torch.randn(hidden.shape[0], hidden.shape[1], self.target_model.config.vocab_size,
-                          device=hidden.device, dtype=hidden.dtype)
-
-    def _sample_from_target(self, input_ids, temperature, top_p):
-        outputs = self.target_model(input_ids)
-        logits = outputs.logits[:, -1, :] / temperature
-        probs = F.softmax(logits, dim=-1)
-
-        sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
-        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-        sorted_indices_to_remove = cumulative_probs > top_p
-        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-        sorted_indices_to_remove[..., 0] = False
-
-        indices_to_remove = sorted_indices_to_remove.scatter(-1, sorted_indices, sorted_indices_to_remove)
-        logits[indices_to_remove] = -float("inf")
-
-        probs = F.softmax(logits, dim=-1)
-        return torch.multinomial(probs, num_samples=1)
+    print(f"\nGenerated text:\n{output_text}")
+    print("\n" + "=" * 50)
+    print("Metrics:")
+    print(f"  Total tokens generated: {generated.shape[1] - original_length}")
+    print(f"  Draft tokens proposed: {total_draft_tokens}")
+    print(f"  Tokens accepted: {total_accepted}")
+    print(f"  Target forward passes: {target_passes}")
+    print(f"  Mean Acceptance Length: {total_accepted/target_passes:.2f}")
+    print(f"  Wall time: {wall_time:.2f}s")
+    print(f"  Tokens/sec: {(generated.shape[1] - original_length) / wall_time:.2f}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="P-EAGLE Inference")
-    parser.add_argument("--target_model", required=True)
-    parser.add_argument("--drafter_checkpoint", required=True)
-    parser.add_argument("--prompt", default="Explain quantum computing")
-    parser.add_argument("--max_tokens", type=int, default=100)
+    parser.add_argument("--target_model", required=True, help="Target model name")
+    parser.add_argument("--drafter_checkpoint", required=True, help="Path to P-EAGLE checkpoint")
+    parser.add_argument("--prompt", default="Explain quantum computing in simple terms.")
+    parser.add_argument("--max_new_tokens", type=int, default=100)
     parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--use_hidden_injection", action="store_true",
-                        help="Enable hidden state injection from target model")
+    parser.add_argument("--device", default="cuda")
 
     args = parser.parse_args()
 
-    engine = PEAGLEInference(
+    run_inference(
         target_model_name=args.target_model,
         drafter_checkpoint=args.drafter_checkpoint,
-        use_hidden_injection=args.use_hidden_injection
+        prompt=args.prompt,
+        max_new_tokens=args.max_new_tokens,
+        temperature=args.temperature,
+        device=args.device,
     )
-
-    output, metrics = engine.generate(
-        args.prompt,
-        max_new_tokens=args.max_tokens,
-        temperature=args.temperature
-    )
-
-    print(f"\nOutput: {output}")
-    print(f"\nMetrics:")
-    print(f"  Tokens: {metrics.total_tokens}")
-    print(f"  Accepted: {metrics.accepted_tokens}")
-    print(f"  MAL: {metrics.mean_acceptance_length:.2f}")
-    print(f"  Speedup: {metrics.speedup:.2f}x")
-    print(f"  Time: {metrics.wall_time:.2f}s")
 
 
 if __name__ == "__main__":

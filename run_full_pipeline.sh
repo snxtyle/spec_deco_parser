@@ -1,6 +1,6 @@
 #!/bin/bash
-# P-EAGLE Full Pipeline Automation Script - FIXED VERSION
-# Includes loss_mask_segments generation and verification steps
+# P-EAGLE Full Pipeline Automation Script - P-EAGLE ARCHITECTURE VERSION
+# Uses PEAGLEDrafterModel with parallel multi-token prediction
 #
 # Usage:
 #   ./run_full_pipeline.sh                          # Run with defaults
@@ -13,24 +13,29 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 echo "================================"
-echo "P-EAGLE Full Pipeline (Fixed)"
+echo "P-EAGLE Full Pipeline (PEAGLE Architecture)"
+echo "Features:"
+echo "  - Parallel multi-token prediction (K draft tokens)"
+echo "  - Learnable mask token embeddings"
+echo "  - Learnable shared hidden state"
+echo "  - Cross-entropy loss on tokens"
 echo "================================"
 
 # ============================================================================
 # DEFAULT CONFIGURATION
 # ============================================================================
 
-# DGX Sparx Configuration: Gemma 3 4B (target) + Gemma 3 270M (drafter)
-# Same model family (Gemma 3) for vocab and hidden state compatibility
+# Configuration: Gemma 3 4B (target) + Gemma 3 270M (drafter)
+# Same family for better compatibility
 TARGET_MODEL="google/gemma-3-4b-it"
 DRAFTER_MODEL="google/gemma-3-270m-it"
 
-# Dimensions for Gemma 3 models
+# Dimensions for models
 TARGET_HIDDEN_DIM="2560"   # gemma-3-4b: 2560
-DRAFTER_HIDDEN_DIM="1920"  # gemma-3-270m: 1920
+DRAFTER_HIDDEN_DIM="640"   # gemma-3-270m: 640 (smaller drafter)
 
-# Training parameters
-SPECULATION_DEPTH="${SPECULATION_DEPTH:-6}"
+# P-EAGLE Training parameters
+SPECULATION_DEPTH="${SPECULATION_DEPTH:-4}"  # K=4 parallel multi-token prediction (EAGLE-3)
 NUM_SAMPLES="${NUM_SAMPLES:-5000}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
 EPOCHS="${EPOCHS:-50}"
@@ -41,10 +46,11 @@ QUANTIZATION="${QUANTIZATION:-8bit}"
 # Paths
 DATA_DIR="${DATA_DIR:-./data}"
 FEATURES_DIR="$DATA_DIR/features"
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-./checkpoints}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-./checkpoints_peagle}"  # P-EAGLE specific dir
 OUTPUT_DIR="${OUTPUT_DIR:-./output}"
 PROCESSED_DIR="$DATA_DIR/processed"
 EVAL_OUTPUT="${EVAL_OUTPUT:-evaluation_results.json}"
+LOGS_DIR="${LOGS_DIR:-./logs}"
 
 # ============================================================================
 # PARSE COMMAND LINE ARGUMENTS
@@ -132,10 +138,23 @@ echo "Step 0: Environment Setup"
 echo "-------------------------"
 
 mkdir -p "$DATA_DIR"{"/raw","/processed","/features","/output"}
-mkdir -p "$CHECKPOINT_DIR" "$OUTPUT_DIR" ./logs ./plot_scripts/plots
+mkdir -p "$CHECKPOINT_DIR" "$OUTPUT_DIR" "$LOGS_DIR" ./plot_scripts/plots
 
-python3 --version
-python3 -c "import torch; print(f'PyTorch: {torch.__version__}'); print(f'CUDA: {torch.cuda.is_available()}')" || {
+# Use venv Python if available, respect externally set PYTHON_CMD
+if [ -z "$PYTHON_CMD" ]; then
+    # Check for venv in script directory
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    if [ -f "$SCRIPT_DIR/venv/bin/python" ]; then
+        PYTHON_CMD="$SCRIPT_DIR/venv/bin/python"
+    elif [ -n "$VIRTUAL_ENV" ]; then
+        PYTHON_CMD="${VIRTUAL_ENV}/bin/python"
+    else
+        PYTHON_CMD="python3"
+    fi
+fi
+
+$PYTHON_CMD --version
+$PYTHON_CMD -c "import torch; print(f'PyTorch: {torch.__version__}'); print(f'CUDA: {torch.cuda.is_available()}')" || {
     echo "ERROR: PyTorch not available"
     exit 1
 }
@@ -165,8 +184,8 @@ if [ "$SKIP_DATA_GEN" = false ]; then
     echo "Step 1: Data Preparation (with loss_mask_segments)"
     echo "---------------------------------------------------"
 
-    # Check for processed data
-    PROCESSED_COUNT=$(find "$PROCESSED_DIR" -name "*.json" -type f 2>/dev/null | wc -l)
+    # Check for processed data (jsonl format)
+    PROCESSED_COUNT=$(find "$PROCESSED_DIR" -name "*.jsonl" -type f 2>/dev/null | wc -l)
 
     if [ "$PROCESSED_COUNT" -eq 0 ]; then
         echo "ERROR: No processed JSON files found in $PROCESSED_DIR"
@@ -177,12 +196,14 @@ if [ "$SKIP_DATA_GEN" = false ]; then
     echo "Found $PROCESSED_COUNT processed files"
 
     # FIXED: generate_data.py now outputs loss_mask_segments (min-words default is 10)
-    CMD="python3 scripts/generate_data.py --local --num-samples $NUM_SAMPLES --input-dir $PROCESSED_DIR --output $DATA_DIR/output --format openai --output-format jsonl --deduplicate"
+    CMD="$PYTHON_CMD scripts/generate_data.py --local --num-samples $NUM_SAMPLES --input-dir $PROCESSED_DIR --output $DATA_DIR/output --format openai --output-format jsonl --deduplicate"
 
     if [ "$RUN_DRY" = true ]; then
         echo "CMD: $CMD"
     else
-        eval $CMD
+        DATA_LOG="$LOGS_DIR/data_gen_$(date +%Y%m%d_%H%M%S).log"
+        echo "Data generation started. Logging to: $DATA_LOG"
+        eval $CMD 2>&1 | tee "$DATA_LOG"
     fi
 
     # Find the generated dataset file
@@ -199,7 +220,7 @@ if [ "$SKIP_DATA_GEN" = false ]; then
     if [ "$RUN_DRY" = false ]; then
         echo ""
         echo "Verifying dataset format..."
-        python3 -c "
+        $PYTHON_CMD -c "
 import json
 with open('$DATASET_FILE', 'r') as f:
     sample = json.loads(f.readline())
@@ -234,22 +255,24 @@ if [ "$SKIP_FEATURE_EXTRACTION" = false ]; then
         rm -f "$FEATURES_DIR"/*.pt
     fi
 
-    CMD="python3 -m p_eagle.scripts.extract_features \
+    CMD="$PYTHON_CMD -m p_eagle.scripts.extract_features \
         --model_path $TARGET_MODEL \
         --tokenizer_path $DRAFTER_MODEL \
         --input_data $DATASET_FILE \
         --output_dir $FEATURES_DIR \
-        --quantization $QUANTIZATION \
+        --quantization 8bit \
         --layers early,middle,final \
         --fusion mean \
-        --batch_size 1 \
-        --shard_size 5000 \
+        --batch_size 32 \
+        --shard_size 500 \
         --max_length 4096"
 
     if [ "$RUN_DRY" = true ]; then
         echo "CMD: $CMD"
     else
-        eval $CMD
+        FEAT_LOG="$LOGS_DIR/feature_extraction_$(date +%Y%m%d_%H%M%S).log"
+        echo "Feature extraction started. Logging to: $FEAT_LOG"
+        eval $CMD 2>&1 | tee "$FEAT_LOG"
     fi
 
     if [ "$RUN_DRY" = false ]; then
@@ -259,7 +282,7 @@ if [ "$SKIP_FEATURE_EXTRACTION" = false ]; then
         # VERIFICATION: Check that masks have non-zero values
         echo ""
         echo "Verifying feature masks..."
-        python3 -c "
+        $PYTHON_CMD -c "
 import torch
 import glob
 pt_files = glob.glob('$FEATURES_DIR/*_shard*.pt')
@@ -296,7 +319,7 @@ if [ "$SKIP_TRAINING" = false ]; then
     export PYTHONDONTWRITEBYTECODE=1
     export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
-    CMD="python3 -m p_eagle.scripts.train_drafter \
+    CMD="$PYTHON_CMD -m p_eagle.scripts.train_drafter \
         --drafter_model $DRAFTER_MODEL \
         --target_hidden_dim $TARGET_HIDDEN_DIM \
         --feature_dir $FEATURES_DIR \
@@ -306,20 +329,15 @@ if [ "$SKIP_TRAINING" = false ]; then
         --learning_rate $LEARNING_RATE \
         --warmup_steps 100 \
         --speculation_depth $SPECULATION_DEPTH \
-        --use_lora \
-        --lora_rank $LORA_RANK \
-        --skip-hardware-check \
-        --dataset-source $DATASET_FILE \
-        $([ "$SKIP_SECURITY_CHECK" = true ] && echo "--skip-security-check")"
+        --yes"
 
     if [ "$RUN_DRY" = true ]; then
         echo "CMD: $CMD"
     else
-        mkdir -p /workspace/P_Eagle/logs
-        LOG_FILE="/workspace/P_Eagle/logs/training_$(date +%Y%m%d_%H%M%S).log"
-        echo "Training started. Logging to: $LOG_FILE"
-        echo "View live: tail -f $LOG_FILE"
-        eval $CMD 2>&1 | tee "$LOG_FILE"
+        TRAIN_LOG="$LOGS_DIR/training_$(date +%Y%m%d_%H%M%S).log"
+        echo "Training started. Logging to: $TRAIN_LOG"
+        echo "View live: tail -f $TRAIN_LOG"
+        eval $CMD 2>&1 | tee "$TRAIN_LOG"
         echo "Training complete. Best model: $CHECKPOINT_DIR/best_model"
     fi
 else
@@ -334,7 +352,7 @@ if [ "$SKIP_EVALUATION" = false ]; then
     echo "Step 4: Evaluation"
     echo "------------------"
 
-    CMD="python3 -m p_eagle.scripts.evaluate \
+    CMD="$PYTHON_CMD -m p_eagle.scripts.evaluate \
         --drafter_checkpoint $CHECKPOINT_DIR/best_model \
         --target_model $TARGET_MODEL \
         --baseline \
@@ -345,14 +363,16 @@ if [ "$SKIP_EVALUATION" = false ]; then
     if [ "$RUN_DRY" = true ]; then
         echo "CMD: $CMD"
     else
-        eval $CMD
+        EVAL_LOG="$LOGS_DIR/evaluation_$(date +%Y%m%d_%H%M%S).log"
+        echo "Evaluation started. Logging to: $EVAL_LOG"
+        eval $CMD 2>&1 | tee "$EVAL_LOG"
         echo "Results: $EVAL_OUTPUT"
 
         # Display key metrics
         if [ -f "$EVAL_OUTPUT" ]; then
             echo ""
             echo "Key Metrics:"
-            python3 -c "
+            $PYTHON_CMD -c "
 import json
 with open('$EVAL_OUTPUT', 'r') as f:
     data = json.load(f)
@@ -374,7 +394,7 @@ echo ""
 echo "Step 5: Generating Plots"
 echo "------------------------"
 
-CMD="python3 -m plot_scripts.generate_plots --mode all --checkpoint_dirs $CHECKPOINT_DIR --eval_file $EVAL_OUTPUT --output_dir plot_scripts/plots"
+CMD="$PYTHON_CMD -m plot_scripts.generate_plots --mode all --checkpoint_dirs $CHECKPOINT_DIR --eval_file $EVAL_OUTPUT --output_dir plot_scripts/plots"
 
 if [ "$RUN_DRY" = true ]; then
     echo "CMD: $CMD"
@@ -393,6 +413,10 @@ else
     echo "PIPELINE COMPLETE!"
 fi
 echo "================================"
+echo ""
+echo "Logs directory: $LOGS_DIR"
+echo "Log files:"
+ls -1t "$LOGS_DIR"/*.log 2>/dev/null | head -10 | while read f; do echo "  - $f"; done
 echo ""
 echo "Quick Commands:"
 echo "  Test inference:"

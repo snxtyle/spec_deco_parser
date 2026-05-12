@@ -11,6 +11,16 @@ from glob import glob
 from typing import Optional, List, Dict, Any, Tuple
 from dataclasses import dataclass
 
+# Load .env file if exists
+env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env')
+if os.path.exists(env_path):
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#') and '=' in line:
+                key, value = line.split('=', 1)
+                os.environ.setdefault(key, value)
+
 # Try to import psutil for system monitoring
 try:
     import psutil
@@ -473,34 +483,60 @@ def load_from_huggingface(limit: Optional[int] = None) -> List[Dict[str, Any]]:
 
 
 def load_from_local(input_dir: str) -> List[Dict[str, Any]]:
-    """Load data from local JSON files in the processed directory."""
-    files = glob(os.path.join(input_dir, "*.json"))
+    """Load data from local JSON/JSONL files in the processed directory."""
+    files = glob(os.path.join(input_dir, "*.json")) + glob(os.path.join(input_dir, "*.jsonl"))
     
     print(f"Loading {len(files)} files from {input_dir}")
     
     valid_samples = []
     for file_path in files:
         try:
-            with open(file_path, "r") as f:
-                data = json.load(f)
-            
-            # Get messages
-            if isinstance(data, list):
-                messages = data
-            elif isinstance(data, dict):
-                messages = data.get("messages", [])
+            # Handle JSONL files (line by line) vs JSON files (full document)
+            if file_path.endswith('.jsonl'):
+                with open(file_path, "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            data = json.loads(line)
+                            # Get messages
+                            if isinstance(data, dict):
+                                messages = data.get("messages", [])
+                            else:
+                                continue
+                            # Check if has tool_calls
+                            if has_tool_calls(messages):
+                                sample = {
+                                    "messages": messages,
+                                    "_source": "local",
+                                    "_file": os.path.basename(file_path)
+                                }
+                                valid_samples.append(sample)
+                        except json.JSONDecodeError:
+                            continue
             else:
-                continue
-            
-            # Check if has tool_calls
-            if has_tool_calls(messages):
-                sample = {
-                    "messages": messages,
-                    "_source": "local",
-                    "_file": os.path.basename(file_path)
-                }
-                valid_samples.append(sample)
-                
+                # Regular JSON file
+                with open(file_path, "r") as f:
+                    data = json.load(f)
+
+                # Get messages
+                if isinstance(data, list):
+                    messages = data
+                elif isinstance(data, dict):
+                    messages = data.get("messages", [])
+                else:
+                    continue
+
+                # Check if has tool_calls
+                if has_tool_calls(messages):
+                    sample = {
+                        "messages": messages,
+                        "_source": "local",
+                        "_file": os.path.basename(file_path)
+                    }
+                    valid_samples.append(sample)
+
         except Exception as e:
             print(f"Error loading {file_path}: {e}")
     

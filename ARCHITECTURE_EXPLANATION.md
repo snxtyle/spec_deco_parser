@@ -8,13 +8,14 @@
    └── Outputs hidden states from layers [7, 14, 21]
    └── These are fused into single vector per token
 
-2. Drafter Model (e.g., Gemma-2B) is trained to predict:
-   └── Input: Token IDs (using compatible tokenizer)
+2. Drafter Model (e.g., Gemma-2B) is trained with EAGLE-3 architecture:
+   └── Input: Concatenated [Token Embeddings; Target Hidden States]
+   └── First layer modified to accept 2x hidden size input
+   └── Separate norms for embeddings and hidden portions
    └── Output: Hidden state vectors matching target's fused hidden states
 
 3. Loss Computation:
-   └── OLD: MSE between predicted and target hidden states
-   └── NEW: KL divergence between token distributions
+   └── KL divergence between token distributions
        ├── Pass predicted hidden through TARGET's lm_head → logits_pred
        ├── Pass target hidden through TARGET's lm_head → logits_target
        └── Minimize KL(logits_pred || logits_target)
@@ -152,12 +153,68 @@ The feature extractor handles multiple content formats:
 
 All formats are normalized to strings for tokenization.
 
+## EAGLE-3 Architecture Details
+
+### Hidden State Injection
+
+The key innovation in EAGLE-3 is hidden state injection via concatenation:
+
+```python
+# First layer input: concatenate embeddings with target hidden states
+input = torch.cat([token_embeddings, target_hidden_states], dim=-1)
+# Shape: [batch, seq_len, 2 * hidden_size]
+```
+
+Inside the first layer:
+1. Split input into embeddings and hidden portions
+2. Apply separate LayerNorm to each
+3. Re-concatenate for attention
+4. Project attention output back to hidden_size for residual
+
+```python
+class Eagle3FirstLayer(nn.Module):
+    def forward(self, hidden_states):
+        # Split concatenated input
+        embeds, hidden = hidden_states[..., :mid], hidden_states[..., mid:]
+
+        # Store residual from hidden portion
+        residual = hidden
+
+        # Separate norms
+        embeds = self.embed_norm(embeds)
+        hidden = self.hidden_norm(hidden)
+
+        # Re-concatenate for attention
+        hidden_states = torch.cat([embeds, hidden], dim=-1)
+
+        # Attention (outputs 2x hidden)
+        attn_output = self.base_layer.self_attn(hidden_states)
+
+        # Project back to hidden_size for residual
+        attn_projected = self.output_proj(attn_output)
+        hidden = residual + attn_projected
+        ...
+```
+
+### Benefits
+- Direct access to target model's representations
+- Better alignment between drafter and target
+- Improved token prediction accuracy
+
 ## Implementation Status
 
+✅ Implemented: EAGLE-3 architecture with hidden state injection
 ✅ Fixed: Token-level loss during training (KL divergence)
 ✅ Fixed: Token alignment with target's lm_head
 ✅ Fixed: Vocab compatibility checking
 ✅ Fixed: Content parsing for nested formats
 ✅ Fixed: loss_mask_segments generation in dataset
-✅ Fixed: Training/inference hidden injection alignment (disabled by default)
+✅ Fixed: Training/inference hidden injection alignment
 ⚠️  Note: Target lm_head is loaded from feature files during training if available
+
+## File Structure
+
+- `p_eagle/models/peagle_drafter.py` - Main drafter model with EAGLE-3 architecture
+  - `Eagle3FirstLayer` - Modified first layer with concatenation handling
+  - `EagleMTPHead` - Multi-token prediction heads
+  - `EagleDrafterModel` - Complete drafter with LoRA support

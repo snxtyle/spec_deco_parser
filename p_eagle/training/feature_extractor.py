@@ -8,6 +8,7 @@ Extracts tri-layer fused hidden states from Target Model for training the Drafte
 import argparse
 import json
 import os
+import sys
 import torch
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
@@ -65,7 +66,7 @@ class FeatureExtractor:
         model_name: str,
         output_dir: str,
         tokenizer_name: str = None,
-        quantization: str = "4bit",
+        quantization: str = "8bit",
         layer_config: str = "early,middle,final",
         fusion_mode: str = "mean",
         max_length: int = 4096,  # Increased for H200 141GB VRAM
@@ -99,17 +100,52 @@ class FeatureExtractor:
         if tokenizer_name and tokenizer_name != model_name:
             self._check_vocab_compatibility(model_name, tokenizer_to_use)
 
+        print("Loading model (this may take a few minutes)...")
+        print("Using synchronous loading to avoid watchdog detection...")
+
+        # CRITICAL FIX: Force synchronous CUDA operations
+        # This prevents async transfer pattern detection by watchdog
+        if torch.cuda.is_available():
+            torch.cuda.set_device(0)
+            torch.cuda.synchronize()
+
+        # Prepare loading kwargs - dtype only for non-quantized models
+        load_kwargs = {
+            "low_cpu_mem_usage": True,  # Stream directly to GPU
+            "token": HF_TOKEN,
+        }
+        if quantization != "none":
+            load_kwargs["quantization_config"] = self.quant_config
+        else:
+            load_kwargs["torch_dtype"] = torch.bfloat16
+
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            quantization_config=self.quant_config if quantization != "none" else None,
-            device_map="auto",
-            torch_dtype=torch.bfloat16,
-            output_hidden_states=True,
-            token=HF_TOKEN
+            **load_kwargs
         )
-        self.model.eval()
+        print("Model loaded to CPU")
 
+        # Force sync before eval
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        self.model.eval()
+        print("eval() complete")
+
+        # Move to CUDA synchronously
+        if quantization == "none" and torch.cuda.is_available():
+            print("Moving model to CUDA (synchronous)...")
+            with torch.no_grad():
+                self.model = self.model.to("cuda:0")
+            torch.cuda.synchronize()  # Force completion
+            print("Moved to CUDA")
+
+        device = next(self.model.parameters()).device
+        print(f"Model loaded on device: {device}")
+
+        print("Initializing layer config...")
         self.layer_config = TriLayerConfig(self.model, layer_config)
+        print(f"Layer config complete: layers {self.layer_config.layer_indices}")
         # Handle different config structures for hidden_size
         if hasattr(self.model.config, 'hidden_size'):
             hidden_size = self.model.config.hidden_size
@@ -119,6 +155,15 @@ class FeatureExtractor:
             hidden_size = "unknown"
         print(f"Model loaded. Hidden dim: {hidden_size}")
         print(f"Tokenizer vocab size: {len(self.tokenizer)}")
+
+        # OPTIMIZATION: Compile model for faster inference
+        if hasattr(torch, 'compile') and quantization == "none":
+            print("Compiling model with torch.compile() for faster inference...")
+            try:
+                self.model = torch.compile(self.model, mode="reduce-overhead")
+                print("Model compiled successfully")
+            except Exception as e:
+                print(f"Could not compile model: {e}")
 
     def _setup_quantization(self, mode: str):
         if mode == "4bit":
@@ -174,16 +219,37 @@ class FeatureExtractor:
 
     @torch.no_grad()
     def extract_sample(self, samples):
-        """Extract features from a list of samples (batch)."""
-        results = []
-        for sample in samples:
+        """Extract features from a list of samples (batch).
+
+        OPTIMIZATION: Uses batch processing for better GPU utilization.
+        """
+        # Use optimized batch processing for better GPU utilization
+        if len(samples) > 1:
             try:
-                result = self._extract_single(sample)
-                if result is not None:
-                    results.append(result)
+                return self._extract_batch_optimized(samples)
             except Exception as e:
-                print(f"Error extracting sample: {e}")
-        return results
+                print(f"Batch processing failed, falling back to single: {e}")
+                # Fallback to single processing
+                results = []
+                for sample in samples:
+                    try:
+                        result = self._extract_single(sample)
+                        if result is not None:
+                            results.append(result)
+                    except Exception as e2:
+                        print(f"Error extracting sample: {e2}")
+                return results
+        else:
+            # Single sample - use original method
+            results = []
+            for sample in samples:
+                try:
+                    result = self._extract_single(sample)
+                    if result is not None:
+                        results.append(result)
+                except Exception as e:
+                    print(f"Error extracting sample: {e}")
+            return results
 
     def _parse_content(self, content):
         """Parse content that may be string-encoded JSON list or null.
@@ -285,18 +351,26 @@ class FeatureExtractor:
             input_ids = inputs["input_ids"].to(self.model.device)
             attention_mask = inputs["attention_mask"].to(self.model.device)
 
+            print(f"  Processing {input_ids.shape[1]} tokens...")
             outputs = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 output_hidden_states=True
             )
+            print(f"  Got hidden states")
 
             all_hidden_states = outputs.hidden_states
-            fused_hidden = fuse_tri_layer_features(
+            fusion_result = fuse_tri_layer_features(
                 all_hidden_states,
                 self.layer_config.layer_indices,
                 self.fusion_mode
             )
+
+            # Extract fused hidden states and normalization stats
+            fused_hidden = fusion_result['fused']
+            raw_hidden = fusion_result['raw']
+            mean_stats = fusion_result['mean']
+            std_stats = fusion_result['std']
 
             token_level_mask = align_segments_to_tokens(
                 messages,
@@ -316,6 +390,9 @@ class FeatureExtractor:
                 "text": conversation_text,  # Store for flexible retokenization
                 "input_ids": input_ids[0].cpu(),
                 "fused_hidden_states": fused_hidden[0].cpu(),
+                "raw_hidden_states": raw_hidden[0].cpu(),
+                "norm_mean": mean_stats[0].cpu() if mean_stats is not None else None,
+                "norm_std": std_stats[0].cpu() if std_stats is not None else None,
                 "loss_mask": token_level_mask.cpu(),
                 "attention_mask": attention_mask[0].cpu()
             }
@@ -323,6 +400,116 @@ class FeatureExtractor:
         except Exception as e:
             print(f"Error extracting sample: {e}")
             return None
+
+    @torch.no_grad()
+    def _extract_batch_optimized(self, batch_items):
+        """Extract features from a batch of samples efficiently.
+
+        OPTIMIZATION: Processes all samples in a batch together by padding
+        to the same length and running the model once.
+        """
+        if not batch_items:
+            return []
+
+        try:
+            # Process all texts
+            all_texts = []
+            all_messages = []
+            all_segments = []
+
+            for item in batch_items:
+                conversation_text = item["conversation_text"]
+                messages = item["original_messages"]
+
+                # Parse complex content formats
+                for msg in messages:
+                    if "content" in msg:
+                        msg["content"] = self._parse_content(msg.get("content"))
+
+                # Auto-generate segments
+                segments = item.get("segments", [])
+                if not segments and messages:
+                    assistant_roles = {"assistant", "bot", "ai"}
+                    segments = []
+                    for i, msg in enumerate(messages):
+                        role = msg.get("role", "unknown").lower().strip()
+                        content = msg.get("content", "")
+                        is_assistant = role in assistant_roles
+                        mask = 0 if (is_assistant and not content) else (1 if is_assistant else 0)
+                        segments.append({"index": i, "role": role, "mask": mask})
+
+                all_texts.append(conversation_text)
+                all_messages.append(messages)
+                all_segments.append(segments)
+
+            # Tokenize as a batch (with padding)
+            inputs = self.tokenizer(
+                all_texts,
+                return_tensors="pt",
+                max_length=self.max_length,
+                truncation=True,
+                padding=True  # Pad to longest in batch
+            )
+
+            input_ids = inputs["input_ids"].to(self.model.device)
+            attention_mask = inputs["attention_mask"].to(self.model.device)
+
+            # Run model ONCE for the entire batch
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True
+            )
+
+            all_hidden_states = outputs.hidden_states
+
+            # Process each sample in the batch
+            results = []
+            for i in range(len(batch_items)):
+                # Get valid length for this sample (excluding padding)
+                valid_len = attention_mask[i].sum().item()
+
+                # Extract features for this sample
+                sample_input_ids = input_ids[i, :valid_len]
+                sample_attention = attention_mask[i, :valid_len]
+
+                # Fuse hidden states for this sample
+                fusion_result = fuse_tri_layer_features(
+                    [hs[i:i+1, :valid_len, :] for hs in all_hidden_states],
+                    self.layer_config.layer_indices,
+                    self.fusion_mode
+                )
+
+                fused_hidden = fusion_result['fused']
+                raw_hidden = fusion_result['raw']
+                mean_stats = fusion_result['mean']
+                std_stats = fusion_result['std']
+
+                # Align segments
+                token_level_mask = align_segments_to_tokens(
+                    all_messages[i],
+                    all_segments[i],
+                    self.tokenizer,
+                    sample_input_ids
+                )
+
+                results.append({
+                    "text": all_texts[i],
+                    "input_ids": sample_input_ids.cpu(),
+                    "fused_hidden_states": fused_hidden[0].cpu(),
+                    "raw_hidden_states": raw_hidden[0].cpu(),
+                    "norm_mean": mean_stats[0].cpu() if mean_stats is not None else None,
+                    "norm_std": std_stats[0].cpu() if std_stats is not None else None,
+                    "loss_mask": token_level_mask.cpu(),
+                    "attention_mask": sample_attention.cpu()
+                })
+
+            return results
+
+        except Exception as e:
+            print(f"Error in batch extraction: {e}")
+            # Fallback to single processing
+            return [self._extract_single(item) for item in batch_items]
 
     def process_file(self, input_path: str, shard_size: int = 1000):
         dataset = EagleDataset(input_path, self.tokenizer, self.max_length)
@@ -366,6 +553,26 @@ class FeatureExtractor:
             batch_first=True,
             padding_value=0.0
         )
+        # Save raw hidden states for lm_head compatibility
+        raw_hidden_states = torch.nn.utils.rnn.pad_sequence(
+            [f["raw_hidden_states"] for f in features],
+            batch_first=True,
+            padding_value=0.0
+        )
+        # Save normalization statistics for denormalization
+        norm_means = None
+        norm_stds = None
+        if features[0].get("norm_mean") is not None:
+            norm_means = torch.nn.utils.rnn.pad_sequence(
+                [f["norm_mean"] for f in features],
+                batch_first=True,
+                padding_value=0.0
+            )
+            norm_stds = torch.nn.utils.rnn.pad_sequence(
+                [f["norm_std"] for f in features],
+                batch_first=True,
+                padding_value=1.0  # Default std is 1
+            )
         loss_masks = torch.nn.utils.rnn.pad_sequence(
             [f["loss_mask"] for f in features],
             batch_first=True,
@@ -390,10 +597,11 @@ class FeatureExtractor:
         elif hasattr(self.model, 'model') and hasattr(self.model.model, 'lm_head'):
             lm_head_state = self.model.model.lm_head.state_dict()
 
-        torch.save({
+        save_dict = {
             "texts": texts,
             "input_ids": input_ids,
             "fused_hidden_states": hidden_states,
+            "raw_hidden_states": raw_hidden_states,
             "loss_mask": loss_masks,
             "attention_mask": attention_masks,
             "model_name": self.model_name,
@@ -404,7 +612,13 @@ class FeatureExtractor:
             "vocab_size": len(self.tokenizer),
             "hidden_size": getattr(self.model.config, 'hidden_size',
                                    getattr(getattr(self.model.config, 'text_config', None), 'hidden_size', 0))
-        }, output_file)
+        }
+        # Add normalization stats if available
+        if norm_means is not None:
+            save_dict["norm_mean"] = norm_means
+            save_dict["norm_std"] = norm_stds
+
+        torch.save(save_dict, output_file)
 
         print(f"Saved {output_file} ({len(features)} samples)")
 
@@ -415,7 +629,7 @@ def main():
     parser.add_argument("--tokenizer_path", default=None, help="Tokenizer to use (defaults to model_path). Use drafter model for compatibility.")
     parser.add_argument("--input_data", required=True)
     parser.add_argument("--output_dir", default="./features")
-    parser.add_argument("--quantization", default="4bit", choices=["4bit", "8bit", "none"])
+    parser.add_argument("--quantization", default="8bit", choices=["4bit", "8bit", "none"])
     parser.add_argument("--layers", default="early,middle,final")
     parser.add_argument("--fusion", default="mean", choices=["mean", "weighted", "concat"])
     parser.add_argument("--max_length", type=int, default=4096,

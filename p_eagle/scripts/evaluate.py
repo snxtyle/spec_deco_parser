@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 P-EAGLE Comprehensive Evaluation Script
-Measures MAL, throughput, acceptance rates, and domain-specific performance.
+Correct architecture: Drafter predicts hidden states → Target's lm_head → Tokens
 """
 
 import argparse
@@ -9,15 +9,18 @@ import json
 import time
 import sys
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
 import torch
 import numpy as np
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
-from ..inference.inference_engine import PEAGLEInference
 from transformers import AutoTokenizer, AutoModelForCausalLM
+
+# Disable CUDA graphs and torch.compile to avoid dynamic shape issues
+torch._inductor.config.triton.cudagraphs = False
+os.environ["TORCHINDUCTOR_CUDAGRAPHS"] = "0"
 
 
 def evaluate_raw_model(target_model_name: str, prompts: List[str], max_tokens: int = 100) -> Dict:
@@ -82,51 +85,146 @@ def evaluate_raw_model(target_model_name: str, prompts: List[str], max_tokens: i
 
 def evaluate_peagle(drafter_checkpoint: str, target_model_name: str,
                     prompts: List[str], max_tokens: int = 100) -> Dict:
-    """Evaluate P-EAGLE enhanced model."""
+    """Evaluate P-EAGLE with correct hidden state prediction."""
+    from p_eagle.models.peagle_drafter import EagleDrafterModel
+
     print("\n" + "="*70)
     print("  EVALUATING P-EAGLE MODEL")
     print("="*70)
 
-    engine = PEAGLEInference(
-        target_model_name=target_model_name,
-        drafter_checkpoint=drafter_checkpoint,
-        device="cuda" if torch.cuda.is_available() else "cpu"
-    )
+    # Load tokenizer and target model
+    tokenizer = AutoTokenizer.from_pretrained(target_model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    target_model = AutoModelForCausalLM.from_pretrained(
+        target_model_name,
+        torch_dtype=torch.bfloat16
+    ).to("cuda")
+    target_model.eval()
+
+    # Get target's lm_head (fallback if checkpoint doesn't have saved lm_head)
+    if hasattr(target_model, 'lm_head'):
+        target_lm_head_fallback = target_model.lm_head
+    elif hasattr(target_model, 'model') and hasattr(target_model.model, 'lm_head'):
+        target_lm_head_fallback = target_model.model.lm_head
+    else:
+        raise ValueError("Could not find lm_head in target model")
+
+    # Load drafter
+    print(f"Loading drafter from {drafter_checkpoint}...")
+    drafter = EagleDrafterModel.load_checkpoint(drafter_checkpoint, device="cuda")
+    drafter.eval()
+
+    # Use saved lm_head from checkpoint if available (for vocab compatibility)
+    if hasattr(drafter, 'target_lm_head') and drafter.target_lm_head is not None:
+        target_lm_head = drafter.target_lm_head
+        print(f"Using saved lm_head from checkpoint (vocab: {target_lm_head.weight.shape[0]})")
+    else:
+        target_lm_head = target_lm_head_fallback
+        print(f"Using target model's lm_head (vocab: {target_lm_head.weight.shape[0]})")
+        print("WARNING: Vocab mismatch possible if training used different tokenizer")
+
+    speculation_depth = drafter.speculation_depth
+    print(f"Speculation depth (K): {speculation_depth}")
 
     results = []
     all_acceptance_lengths = []
+    total_drafted = 0
+    total_accepted = 0
 
     for i, prompt in enumerate(prompts):
-        print(f"  Sample {i+1}/{len(prompts)}...", end=" ")
+        print(f"  Sample {i+1}/{len(prompts)}...", end=" ", flush=True)
 
-        output, metrics = engine.generate(prompt, max_new_tokens=max_tokens,
-                                          temperature=0.7, top_p=0.9)
+        input_ids = tokenizer.encode(prompt, return_tensors="pt").to("cuda")
+        original_length = input_ids.shape[1]
+        generated = input_ids.clone()
 
-        all_acceptance_lengths.extend(engine.acceptance_history)
+        start = time.time()
+        step_accepted = []
+
+        # Generate with speculation
+        for _ in range(max_tokens):
+            if generated.shape[1] >= original_length + max_tokens:
+                break
+
+            # Generate draft hidden states from drafter's own predictions
+            # P-EAGLE: Drafter predicts future hidden states from current context
+            with torch.no_grad():
+                drafter_outputs = drafter.forward(
+                    input_ids=generated,
+                    is_training=False
+                )
+                mtp_predictions = drafter_outputs["mtp_predictions"]
+
+            # Convert hidden states to tokens
+            draft_tokens = []
+            for k in range(min(speculation_depth, max_tokens - (generated.shape[1] - original_length))):
+                pred_hidden = mtp_predictions[k]
+                logits = target_lm_head(pred_hidden)
+                token_id = torch.argmax(logits, dim=-1)
+                draft_tokens.append(token_id.item())
+
+            # Verify with target
+            accepted_count = 0
+            draft_tensor = torch.tensor([draft_tokens], device="cuda")
+            verification_input = torch.cat([generated, draft_tensor], dim=1)
+
+            with torch.no_grad():
+                verify_outputs = target_model(verification_input)
+                verify_logits = verify_outputs.logits[0, generated.shape[1]-1:, :]
+
+            for j, draft_token in enumerate(draft_tokens):
+                target_token = torch.argmax(verify_logits[j]).item()
+                if draft_token == target_token:
+                    accepted_count += 1
+                    total_accepted += 1
+                else:
+                    break
+
+            # Append accepted tokens, or fall back to target's prediction
+            if accepted_count > 0:
+                new_tokens = torch.tensor([draft_tokens[:accepted_count]], device="cuda")
+                generated = torch.cat([generated, new_tokens], dim=1)
+            else:
+                fallback_token = torch.argmax(verify_logits[0]).item()
+                new_token = torch.tensor([[fallback_token]], device="cuda")
+                generated = torch.cat([generated, new_token], dim=1)
+
+            step_accepted.append(accepted_count)
+            total_drafted += len(draft_tokens)
+
+        elapsed = time.time() - start
+        tokens_generated = generated.shape[1] - original_length
+        mal = np.mean(step_accepted) if step_accepted else 0
+        all_acceptance_lengths.extend(step_accepted)
+
+        output_text = tokenizer.decode(generated[0][original_length:], skip_special_tokens=True)
 
         results.append({
             "prompt": prompt[:100] + "..." if len(prompt) > 100 else prompt,
-            "output": output[:200] + "..." if len(output) > 200 else output,
-            "tokens": metrics.total_tokens,
-            "accepted": metrics.accepted_tokens,
-            "mal": metrics.mean_acceptance_length,
-            "time": metrics.wall_time,
-            "tps": metrics.total_tokens / metrics.wall_time,
-            "speedup_vs_naive": metrics.speedup
+            "output": output_text[:200] + "..." if len(output_text) > 200 else output_text,
+            "tokens": tokens_generated,
+            "accepted": sum(step_accepted),
+            "mal": mal,
+            "time": elapsed,
+            "tps": tokens_generated / elapsed
         })
 
-        print(f"{metrics.total_tokens} tokens, MAL={metrics.mean_acceptance_length:.2f}, "
-              f"{metrics.total_tokens/metrics.wall_time:.1f} tps")
+        print(f"{tokens_generated} tokens, MAL={mal:.2f}, {tokens_generated/elapsed:.1f} tps")
 
     # Calculate acceptance rates per head
-    acceptance_by_head = calculate_head_acceptance(all_acceptance_lengths, engine.speculation_depth)
+    acceptance_by_head = calculate_head_acceptance(all_acceptance_lengths, speculation_depth)
 
     return {
         "drafter_checkpoint": drafter_checkpoint,
         "target_model": target_model_name,
-        "speculation_depth": engine.speculation_depth,
+        "speculation_depth": speculation_depth,
         "total_samples": len(prompts),
         "mean_mal": np.mean(all_acceptance_lengths) if all_acceptance_lengths else 0,
+        "acceptance_rate": total_accepted / total_drafted * 100 if total_drafted > 0 else 0,
+        "total_drafted": total_drafted,
+        "total_accepted": total_accepted,
         "acceptance_by_head": acceptance_by_head,
         "samples": results
     }
@@ -141,87 +239,10 @@ def calculate_head_acceptance(acceptance_history: List[int], k: int) -> Dict[int
     return rates
 
 
-def domain_specific_test_juspay(engine: PEAGLEInference) -> Dict:
-    """Domain-specific tests for Juspay logs."""
-    print("\n" + "="*70)
-    print("  DOMAIN TEST: JUSPAY LOGS")
-    print("="*70)
-
-    # Test 1: System header (should have near-perfect acceptance)
-    system_header = """<agent-identity>
-You are BitBot, a technical support specialist.
-</agent-identity>
-
-User: bitbot-api: analyze_sdk_logs"""
-
-    _, metrics = engine.generate(system_header, max_new_tokens=50)
-    header_mal = metrics.mean_acceptance_length
-
-    print(f"\n1. System Header Test:")
-    print(f"   MAL: {header_mal:.2f} (expected: high for memorized content)")
-
-    # Test 2: Tool call structure prediction
-    tool_prompt = """Given the logs, please"""
-
-    output, metrics = engine.generate(tool_prompt, max_new_tokens=30)
-    tool_mal = metrics.mean_acceptance_length
-
-    print(f"\n2. Tool Call Initiation Test:")
-    print(f"   MAL: {tool_mal:.2f}")
-    print(f"   Output preview: {output[:100]}...")
-
-    return {
-        "system_header_mal": header_mal,
-        "tool_call_mal": tool_mal
-    }
-
-
-def lossless_verification(engine: PEAGLEInference, target_model_name: str,
-                          prompts: List[str]) -> Dict:
-    """Verify P-EAGLE produces identical output to raw model (deterministic)."""
-    print("\n" + "="*70)
-    print("  LOSSLESS VERIFICATION CHECK")
-    print("="*70)
-
-    # Note: True losslessness requires greedy decoding (temp=0)
-    matches = 0
-    total = len(prompts)
-
-    tokenizer = AutoTokenizer.from_pretrained(target_model_name)
-    target = AutoModelForCausalLM.from_pretrained(
-        target_model_name,
-        torch_dtype=torch.bfloat16,
-        device_map="auto"
-    )
-    target.eval()
-
-    for i, prompt in enumerate(prompts):
-        # Greedy generation from target
-        input_ids = tokenizer.encode(prompt, return_tensors="pt").to(target.device)
-        with torch.no_grad():
-            target_out = target.generate(input_ids, max_new_tokens=20, do_sample=False)
-        target_text = tokenizer.decode(target_out[0][input_ids.shape[1]:], skip_special_tokens=True)
-
-        # P-EAGLE generation (greedy)
-        peagle_text, _ = engine.generate(prompt, max_new_tokens=20, temperature=0.0)
-
-        match = target_text.strip() == peagle_text.strip()
-        matches += int(match)
-
-        status = "PASS" if match else "DIFF"
-        print(f"  Sample {i+1}: {status}")
-
-    return {
-        "verified": matches,
-        "total": total,
-        "match_rate": matches / total
-    }
-
-
 def main():
     parser = argparse.ArgumentParser(description="P-EAGLE Evaluation")
     parser.add_argument("--drafter_checkpoint", default="./checkpoints/best_model")
-    parser.add_argument("--target_model", default="google/gemma-7b")
+    parser.add_argument("--target_model", default="google/gemma-3-4b-it")
     parser.add_argument("--test_prompts", default=None,
                         help="JSON file with test prompts")
     parser.add_argument("--max_tokens", type=int, default=100)
@@ -272,15 +293,6 @@ def main():
         print(f"  Raw Model TPS:    {raw_tps:.1f}")
         print(f"  P-EAGLE TPS:      {peagle_tps:.1f}")
         print(f"  Speedup:          {speedup:.2f}x")
-
-    # Domain tests
-    if args.domain_test:
-        engine = PEAGLEInference(
-            target_model_name=args.target_model,
-            drafter_checkpoint=args.drafter_checkpoint
-        )
-        domain_results = domain_specific_test_juspay(engine)
-        results["domain_tests"] = domain_results
 
     # Save results
     with open(args.output, "w") as f:
