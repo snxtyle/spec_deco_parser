@@ -267,48 +267,60 @@ class EagleTrainingDataset(Dataset):
         if "raw_hidden_states" in shard_data:
             sample["raw_hidden_states"] = shard_data["raw_hidden_states"][local_idx]
 
-        # Process the sample (same logic as before)
-        target_len = min(len(sample["fused_hidden_states"]), self.max_seq_len)
+        # STEP 1: INTELLIGENT WINDOW SELECTION on ORIGINAL features
+        loss_mask_full = sample["loss_mask"]
+        seq_len = len(loss_mask_full)
 
-        # Retokenize with drafter's tokenizer if text available
-        if sample["text"] is not None:
-            drafter_inputs = self.tokenizer(
-                sample["text"],
-                return_tensors="pt",
-                max_length=self.max_seq_len,
-                truncation=True,
-                padding=False
-            )
-            drafter_ids = drafter_inputs["input_ids"][0]
-            drafter_mask = drafter_inputs["attention_mask"][0]
+        if seq_len > self.max_seq_len:
+            # Find the best window that maximizes mask coverage
+            # Use tensor operations for efficiency (avoid slow .tolist() conversion)
+            best_start = 0
+            best_count = 0
+            step = max(1, (seq_len - self.max_seq_len) // 20)  # At least 20 windows checked
+            for start in range(0, seq_len - self.max_seq_len + 1, step):
+                end = start + self.max_seq_len
+                count = int(loss_mask_full[start:end].sum())
+                if count > best_count:
+                    best_count = count
+                    best_start = start
 
-            # Align drafter sequence to target length
-            if len(drafter_ids) >= target_len:
-                input_ids = drafter_ids[:target_len]
-                attention_mask = drafter_mask[:target_len]
+            # If no mask found in any window, use middle of sequence
+            if best_count == 0:
+                best_start = (seq_len - self.max_seq_len) // 2
+
+            # Slice all tensors to the same window
+            slice_range = slice(best_start, min(best_start + self.max_seq_len, seq_len))
+            input_ids = sample["input_ids"][slice_range]
+            attention_mask = sample["attention_mask"][slice_range]
+            loss_mask = loss_mask_full[slice_range]
+            if "raw_hidden_states" in sample:
+                target_hidden = sample["raw_hidden_states"][slice_range]
             else:
-                # Pad to match target length
-                pad_len = target_len - len(drafter_ids)
-                pad_id = self.tokenizer.pad_token_id or 0
-                input_ids = torch.cat([drafter_ids, torch.full((pad_len,), pad_id, dtype=torch.long)])
-                attention_mask = torch.cat([drafter_mask, torch.zeros(pad_len, dtype=torch.long)])
+                target_hidden = sample["fused_hidden_states"][slice_range]
         else:
-            # Fallback: use target's tokenization (may cause vocab mismatch)
-            input_ids = sample["input_ids"][:target_len]
-            attention_mask = sample["attention_mask"][:target_len]
+            input_ids = sample["input_ids"]
+            attention_mask = sample["attention_mask"]
+            loss_mask = loss_mask_full
+            if "raw_hidden_states" in sample:
+                target_hidden = sample["raw_hidden_states"]
+            else:
+                target_hidden = sample["fused_hidden_states"]
 
-        # Use raw hidden states for lm_head compatibility
-        if "raw_hidden_states" in sample:
-            target_hidden = sample["raw_hidden_states"][:target_len]
-        else:
-            # Fallback to fused (legacy features)
-            target_hidden = sample["fused_hidden_states"][:target_len]
+        # STEP 2: Truncate/pad to exact max_seq_len
+        target_len = min(len(target_hidden), self.max_seq_len)
+
+        # Use target's tokenization (already aligned with hidden states)
+        # Skip retokenization to maintain alignment with windowed data
+        input_ids = input_ids[:target_len]
+        attention_mask = attention_mask[:target_len]
+        loss_mask_sliced = loss_mask[:target_len]
+        target_hidden = target_hidden[:target_len]
 
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "target_hidden": target_hidden,
-            "loss_mask": sample["loss_mask"][:target_len]
+            "loss_mask": loss_mask_sliced
         }
 
 

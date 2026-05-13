@@ -20,7 +20,9 @@ from datetime import timedelta, datetime
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, random_split
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, random_split, DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 from transformers import get_cosine_schedule_with_warmup, AutoTokenizer
 from bitsandbytes.optim import PagedAdamW8bit
@@ -31,6 +33,32 @@ from ..models.peagle_drafter import EagleDrafterModel
 from ..utils.feature_utils import EagleTrainingDataset
 from ..utils.loss_utils import masked_mse_loss, hidden_state_token_loss
 from ..utils.metrics import MetricsTracker, GenerationMetrics
+
+
+def setup_distributed():
+    """Initialize distributed training."""
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+
+        dist.init_process_group(
+            backend='nccl',
+            init_method='env://',
+            world_size=world_size,
+            rank=rank
+        )
+
+        torch.cuda.set_device(local_rank)
+        return rank, world_size, local_rank
+    else:
+        return 0, 1, 0
+
+
+def cleanup_distributed():
+    """Cleanup distributed training."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def setup_training_logger(output_dir: Path, run_name: str = None) -> logging.Logger:
@@ -589,7 +617,10 @@ class EagleTrainer:
         run_log_dir: Path = None,
         gpu_safety_margin_gb: float = 1.5,
         resume_from: str = None,
-        gradient_accumulation_steps: int = 1
+        gradient_accumulation_steps: int = 1,
+        max_seq_len: int = 2048,
+        rank: int = 0,
+        world_size: int = 1
     ):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -606,6 +637,9 @@ class EagleTrainer:
         self.logger = logger or logging.getLogger("peagle_training")
         self.run_log_dir = run_log_dir
         self.resume_from = resume_from
+        self.rank = rank
+        self.world_size = world_size
+        self.is_main_process = (rank == 0)
 
         # Initialize GPU memory monitor
         self.gpu_monitor = GPUMemoryMonitor(
@@ -641,18 +675,28 @@ class EagleTrainer:
             quantization=quantization
         )
 
-        # Load checkpoint if resuming
-        if self.resume_from:
+        # Wrap model with DDP if using multiple GPUs
+        if self.world_size > 1:
+            self.model = DDP(self.model, device_ids=[self.rank], output_device=self.rank)
+            if self.is_main_process:
+                self.logger.info(f"Wrapped model with DDP (world_size={self.world_size})")
+
+        # Load checkpoint if resuming (only on main process)
+        if self.resume_from and self.is_main_process:
             self.logger.info(f"Resuming training from checkpoint: {self.resume_from}")
-            self.model.load_checkpoint(self.resume_from, device=device)
-            # Extract step number from checkpoint name (e.g., checkpoint_step_1000)
+            # Unwrap DDP if needed to load checkpoint
+            model_to_load = self.model.module if hasattr(self.model, 'module') else self.model
+            model_to_load.load_checkpoint(self.resume_from, device=device)
+            # Extract step number from checkpoint name (e.g. checkpoint_step_1000)
             import re
             step_match = re.search(r'step_(\d+)', self.resume_from)
             if step_match:
                 self.global_step = int(step_match.group(1))
-                self.logger.info(f"Resumed from step {self.global_step}")
+                if self.is_main_process:
+                    self.logger.info(f"Resumed from step {self.global_step}")
             else:
-                self.logger.warning("Could not extract step number from checkpoint name")
+                if self.is_main_process:
+                    self.logger.warning("Could not extract step number from checkpoint name")
 
         # === SPEED OPTIMIZATIONS ===
         # Enable TF32 for faster matmul (10% speedup, no quality loss)
@@ -742,7 +786,7 @@ class EagleTrainer:
             feature_dir=feature_dir,
             tokenizer=self.tokenizer,
             speculation_depth=speculation_depth,
-            max_seq_len=2048,
+            max_seq_len=max_seq_len,
             shard_cache_size=1  # Keep only 1 shard in RAM at a time
         )
 
@@ -759,12 +803,31 @@ class EagleTrainer:
 
         print(f"Dataset split: {train_size} train, {val_size} validation")
 
+        # Create samplers for distributed training
+        if self.world_size > 1:
+            self.train_sampler = DistributedSampler(
+                self.train_subset,
+                num_replicas=self.world_size,
+                rank=self.rank,
+                shuffle=True
+            )
+            self.val_sampler = DistributedSampler(
+                self.val_subset,
+                num_replicas=self.world_size,
+                rank=self.rank,
+                shuffle=False
+            )
+        else:
+            self.train_sampler = None
+            self.val_sampler = None
+
         # Create dataloaders
         # Note: pin_memory=False because we move tensors to device in training loop
         self.train_loader = DataLoader(
             self.train_subset,
             batch_size=batch_size,
-            shuffle=True,
+            shuffle=(self.train_sampler is None),  # Shuffle only if no sampler
+            sampler=self.train_sampler,
             collate_fn=self._collate_fn,
             num_workers=0,  # Must be 0 for lazy loading to work correctly
             pin_memory=False
@@ -774,6 +837,7 @@ class EagleTrainer:
             self.val_subset,
             batch_size=batch_size,
             shuffle=False,
+            sampler=self.val_sampler,
             collate_fn=self._collate_fn,
             num_workers=0,
             pin_memory=False
@@ -1185,13 +1249,18 @@ class EagleTrainer:
             self.logger.info(f"  OK: {mask_sum} trainable tokens in first batch")
 
         for epoch in range(self.num_epochs):
+            # Set epoch for distributed sampler to ensure different shuffling each epoch
+            if self.train_sampler is not None:
+                self.train_sampler.set_epoch(epoch)
+
             self.logger.info(f"\n{'='*50}")
             self.logger.info(f"Epoch {epoch + 1}/{self.num_epochs}")
             self.logger.info(f"{'='*50}")
 
-            # Log curriculum learning status
+            # Log curriculum learning status (only on main process)
             active_heads = self._get_active_heads(epoch + 1)
-            self.logger.info(f"Curriculum: Training heads 1-{active_heads} of {self.model.speculation_depth}")
+            if self.is_main_process:
+                self.logger.info(f"Curriculum: Training heads 1-{active_heads} of {self.model.speculation_depth}")
 
             epoch_losses = []
             epoch_ce_losses = []
@@ -1647,10 +1716,15 @@ class EagleTrainer:
         return total_loss, metrics
 
     def _save_checkpoint(self, name: str):
-        """Save model checkpoint."""
+        """Save model checkpoint (only on main process)."""
+        if not self.is_main_process:
+            return
+
         checkpoint_dir = self.output_dir / name
+        # Unwrap DDP model if needed before saving
+        model_to_save = self.model.module if hasattr(self.model, 'module') else self.model
         # Pass target_lm_head to ensure vocab compatibility during inference
-        self.model.save_checkpoint(str(checkpoint_dir), target_lm_head=self.target_lm_head)
+        model_to_save.save_checkpoint(str(checkpoint_dir), target_lm_head=self.target_lm_head)
         self.logger.info(f"Checkpoint saved to {checkpoint_dir}")
 
 
@@ -1686,12 +1760,22 @@ def main():
                         help="Resume training from checkpoint directory (e.g., checkpoints_peagle_v2/checkpoint_step_1000)")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
                         help="Number of steps to accumulate gradients before updating weights. Larger values = less memory but slower training (default: 1)")
+    parser.add_argument("--max_seq_len", type=int, default=2048,
+                        help="Maximum sequence length for training. Reduce to 1024 to save VRAM on memory-constrained systems (default: 2048)")
 
     args = parser.parse_args()
 
-    # Setup logging FIRST - before anything else
+    # Initialize distributed training if using multiple GPUs
+    rank, world_size, local_rank = setup_distributed()
+    is_main = (rank == 0)
+
+    # Setup logging FIRST - before anything else (only on main process for file logging)
     output_path = Path(args.output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
+    if is_main:
+        output_path.mkdir(parents=True, exist_ok=True)
+    # Barrier to ensure directory is created before other processes proceed
+    if world_size > 1:
+        dist.barrier()
     logger, run_log_dir, run_id = setup_training_logger(output_path, args.run_name)
 
     # Log all arguments
@@ -1737,23 +1821,30 @@ def main():
         run_log_dir=run_log_dir,
         gpu_safety_margin_gb=args.gpu_safety_margin,
         resume_from=args.resume,
-        gradient_accumulation_steps=args.gradient_accumulation_steps
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        max_seq_len=args.max_seq_len,
+        rank=rank,
+        world_size=world_size
     )
 
     try:
         trainer.train()
-        logger.info(f"\n{'='*70}")
-        logger.info("TRAINING COMPLETED SUCCESSFULLY")
-        logger.info(f"{'='*70}")
-        logger.info(f"Logs saved to: {run_log_dir}")
-        logger.info(f"Best model: {args.output_dir}/best_model")
+        if is_main:
+            logger.info(f"\n{'='*70}")
+            logger.info("TRAINING COMPLETED SUCCESSFULLY")
+            logger.info(f"{'='*70}")
+            logger.info(f"Logs saved to: {run_log_dir}")
+            logger.info(f"Best model: {args.output_dir}/best_model")
     except Exception as e:
-        logger.exception("Training failed with error:")
-        logger.error(f"\n{'='*70}")
-        logger.error("TRAINING FAILED")
-        logger.error(f"{'='*70}")
-        logger.error(f"See logs for details: {run_log_dir}")
+        if is_main:
+            logger.exception("Training failed with error:")
+            logger.error(f"\n{'='*70}")
+            logger.error("TRAINING FAILED")
+            logger.error(f"{'='*70}")
+            logger.error(f"See logs for details: {run_log_dir}")
         raise
+    finally:
+        cleanup_distributed()
 
 
 if __name__ == "__main__":
